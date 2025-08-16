@@ -24,8 +24,6 @@ def _quote_unquoted_keys(s: str) -> str:
     return re.sub(_key_quote_pattern, r'"\1":', s)
 
 def _normalize_number(x) -> float:
-    if x is None:
-        return 0.0
     if isinstance(x, (int, float)):
         return float(x)
     s = str(x).strip().replace(",", ".").replace('"', '').replace("'", '')
@@ -94,12 +92,11 @@ def main():
     p.add_argument('--side', choices=['asks', 'bids'], default='asks', help='Buy (asks) or sell (bids).')
     p.add_argument('--max-impact-pct', type=float, required=True, help='Max tolerated price impact (percentage).')
     p.add_argument('--usd-amount', type=float, default=None, help='Optional: USD amount to invest.')
-    p.add_argument('--row-index', type=int, default=None, help='Row index to analyze.')
     p.add_argument('--all-rows', action='store_true', help='Process all rows for the symbol.')
-    p.add_argument('--excel-out', default=None, help='Path to output Excel file.')
+    p.add_argument('--sep', default=',', help='CSV separator, e.g. , or :')
     args = p.parse_args()
-    df = pd.read_csv(args.csv, sep=',')
-    df = pd.read_csv(args.csv, sep=',', usecols=['ts', 'symbol', 'base_price', 'bids', 'asks'])
+    df = pd.read_csv(args.csv, sep=args.sep)
+    df = pd.read_csv(args.csv, sep=args.sep, usecols=['ts', 'symbol', 'base_price', 'bids', 'asks'])
     if args.symbol:
         df = df[df['symbol'] == args.symbol].reset_index(drop=True)
     if df.empty:
@@ -108,7 +105,7 @@ def main():
     results = []
     price_diff_list = []
     investable_list = []
-    rows = df.iterrows() if args.all_rows else [(args.row_index if args.row_index is not None else 0, df.iloc[0])]
+    rows = df.iterrows()  # Always process all rows
     for idx, row in rows:
         levels = parse_orderbook_blob(row['asks'] if args.side == 'asks' else row['bids'])
         levels = sorted(levels, key=lambda d: d['px'], reverse=(args.side == 'bids'))
@@ -140,13 +137,9 @@ def main():
             '_day': day_str
         }
         results.append(result)
-        if not args.all_rows:
-            print(f"\n=== Price Impact Result ===")
-            print(f"Symbol: {row['symbol']} | Side: {side_str} | Time: {time_str}")
-            print(f"Base price: {base_price_num:.3f} | Price diff: {price_diff:.3f} | Max investable USD: {max_investable:.3f}")
 
     # Calculate metric (out of 100) for each row
-    if args.all_rows and results:
+    if results:
         price_diff_arr = pd.Series(price_diff_list)
         investable_arr = pd.Series(investable_list)
         if args.side == 'asks':  # Buy
@@ -158,62 +151,61 @@ def main():
         for i, m in enumerate(metric):
             results[i]['best_time_metric'] = round(m, 1)
 
-    # Save one Excel per day
-    if args.all_rows and args.excel_out:
-        import matplotlib.pyplot as plt
-        import os
+    # Always save one Excel per day as Results_<day>.xlsx
+    import matplotlib.pyplot as plt
+    import os
 
-        df_out = pd.DataFrame(results)
-        note = f"This Excel is for price impact: {args.max_impact_pct}"
+    df_out = pd.DataFrame(results)
+    note = f"This Excel is for price impact: {args.max_impact_pct}"
 
-        for day, group in df_out.groupby('_day'):
-            group = group.drop(columns=['_day'])
-            excel_path = f"{os.path.splitext(args.excel_out)[0]}_{day}.xlsx"
-            # Create graphs for this day
+    for day, group in df_out.groupby('_day'):
+        group = group.drop(columns=['_day'])
+        excel_path = f"Results_{day}.xlsx"
+        # Create graphs for this day
 
-            # Adapt y-axis for price_diff depending on max difference
-            plt.figure(figsize=(10, 6))
-            plt.plot(group['time'], group['price_diff'], marker='o')
-            plt.xticks(rotation=45)
-            plt.title('Price Diff Over Time')
-            plt.xlabel('Time')
-            plt.ylabel('Price Diff')
-            plt.tight_layout()
-            diff_min = group['price_diff'].min()
-            diff_max = group['price_diff'].max()
-            if abs(diff_max - diff_min) < 0.01:
-                plt.ylim(diff_min - 0.01, diff_max + 0.01)
-            else:
-                plt.ylim(diff_min - 0.1 * abs(diff_max - diff_min), diff_max + 0.1 * abs(diff_max - diff_min))
-            plt.savefig('price_diff_plot.png')
+        # Adapt y-axis for price_diff depending on max difference
+        plt.figure(figsize=(10, 6))
+        plt.plot(group['time'], group['price_diff'], marker='o')
+        plt.xticks(rotation=45)
+        plt.title('Price Diff Over Time')
+        plt.xlabel('Time')
+        plt.ylabel('Price Diff')
+        plt.tight_layout()
+        diff_min = group['price_diff'].min()
+        diff_max = group['price_diff'].max()
+        if abs(diff_max - diff_min) < 0.01:
+            plt.ylim(diff_min - 0.01, diff_max + 0.01)
+        else:
+            plt.ylim(diff_min - 0.1 * abs(diff_max - diff_min), diff_max + 0.1 * abs(diff_max - diff_min))
+        plt.savefig('price_diff_plot.png')
 
-            plt.figure(figsize=(10, 6))
-            plt.plot(group['time'], group['max_investable_usd'], marker='o', color='green')
-            plt.xticks(rotation=45)
-            plt.title('Max Investable USD Over Time')
-            plt.xlabel('Time')
-            plt.ylabel('Max Investable USD')
-            plt.tight_layout()
-            plt.savefig('max_investable_plot.png')
+        plt.figure(figsize=(10, 6))
+        plt.plot(group['time'], group['max_investable_usd'], marker='o', color='green')
+        plt.xticks(rotation=45)
+        plt.title('Max Investable USD Over Time')
+        plt.xlabel('Time')
+        plt.ylabel('Max Investable USD')
+        plt.tight_layout()
+        plt.savefig('max_investable_plot.png')
 
-            plt.figure(figsize=(10, 6))
-            plt.plot(group['time'], group['best_time_metric'], marker='o', color='purple')
-            plt.xticks(rotation=45)
-            plt.title('Best Time Metric Over Time')
-            plt.xlabel('Time')
-            plt.ylabel('Best Time Metric')
-            plt.tight_layout()
-            plt.savefig('best_time_metric_plot.png')
+        plt.figure(figsize=(10, 6))
+        plt.plot(group['time'], group['best_time_metric'], marker='o', color='purple')
+        plt.xticks(rotation=45)
+        plt.title('Best Time Metric Over Time')
+        plt.xlabel('Time')
+        plt.ylabel('Best Time Metric')
+        plt.tight_layout()
+        plt.savefig('best_time_metric_plot.png')
 
-            with pd.ExcelWriter(excel_path, engine='xlsxwriter') as writer:
-                pd.DataFrame([{'note': note}]).to_excel(writer, index=False, header=False, startrow=0)
-                group.to_excel(writer, index=False, startrow=2)
-                workbook = writer.book
-                worksheet = writer.sheets['Sheet1']
-                worksheet.insert_image('H2', 'price_diff_plot.png')
-                worksheet.insert_image('H22', 'max_investable_plot.png')
-                worksheet.insert_image('H42', 'best_time_metric_plot.png')
-            print(f"Results and graphs saved to {excel_path}")
-
+        with pd.ExcelWriter(excel_path, engine='xlsxwriter') as writer:
+            pd.DataFrame([{'note': note}]).to_excel(writer, index=False, header=False, startrow=0)
+            group.to_excel(writer, index=False, startrow=2)
+            workbook = writer.book
+            worksheet = writer.sheets['Sheet1']
+            worksheet.insert_image('H2', 'price_diff_plot.png')
+            worksheet.insert_image('H22', 'max_investable_plot.png')
+            worksheet.insert_image('H42', 'best_time_metric_plot.png')
+        print(f"Results and graphs saved to {excel_path}")
 if __name__ == '__main__':
+    main()_ == '__main__':
     main()
