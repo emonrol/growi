@@ -18,7 +18,7 @@ from typing import Iterable, List, Dict, Optional, Tuple
 
 import pandas as pd
 
-_key_quote_pattern = re.compile(r"(?<=\{|,)\s*([A-Za-z_][A-Za-z0-9_]*)\s*:")
+_key_quote_pattern = re.compile(r"(?<=\{|,)\s*([A-Za-z_][A-Zael0-9_]*)\s*:")
 
 def _quote_unquoted_keys(s: str) -> str:
     return re.sub(_key_quote_pattern, r'"\1":', s)
@@ -61,15 +61,13 @@ class ImpactPoint:
     avg_px: float
 
 
-def estimate_price_impact(levels: Iterable[Dict[str, float]], start_price: float, slippage_pct: float, side: str) -> List[ImpactPoint]:
+def estimate_price_impact(levels: Iterable[Dict[str, float]], start_price: float, max_impact_pct: float, side: str) -> List[ImpactPoint]:
     side = side.lower()
     if side not in {"asks", "bids"}:
         raise ValueError("side must be 'asks' or 'bids'")
-    max_up = start_price * (1.0 + slippage_pct / 100.0)
-    max_dn = start_price * (1.0 - slippage_pct / 100.0)
+    target_px = start_price * (1.0 + max_impact_pct / 100.0) if side == 'asks' else start_price * (1.0 - max_impact_pct / 100.0)
     cum_qty = 0.0
     notional = 0.0
-    out: List[ImpactPoint] = []
     for lvl in levels:
         px, sz = float(lvl['px']), float(lvl['sz'])
         if sz <= 0:
@@ -77,120 +75,145 @@ def estimate_price_impact(levels: Iterable[Dict[str, float]], start_price: float
         cum_qty += sz
         notional += px * sz
         avg = notional / cum_qty
-        out.append(ImpactPoint(cum_qty, notional, avg))
-        if (avg >= max_up and side == 'asks') or (avg <= max_dn and side == 'bids'):
-            break
-    return out
-
-
-def solve_partial_at_target(prev_notional: float, prev_qty: float, level_px: float, level_sz: float, target_avg_px: float) -> Optional[Tuple[float, float]]:
-    """Return (x_qty, notional_at_target) needed within this level to hit target avg.
-
-    Solve for x in (N + p*x)/(Q + x) = T  =>  x = (T*Q - N)/(p - T)
-    """
-    denom = (level_px - target_avg_px)
-    x = (target_avg_px * prev_qty - prev_notional) / denom
-    notional_at_target = prev_notional + level_px * x
-    return x, notional_at_target
-
-
-def exact_threshold_allocation(levels: Iterable[Dict[str, float]], start_price: float, slippage_pct: float, side: str) -> Optional[Tuple[float, float, float]]:
-    """Walk the book and return (qty_at_target, notional_at_target, avg_px_target) at the exact slippage threshold.
-    If the threshold is never reached, return None.
-    """
-    side = side.lower()
-    if side not in {"asks", "bids"}:
-        raise ValueError("side must be 'asks' or 'bids'")
-    target = start_price * (1.0 + slippage_pct / 100.0) if side == 'asks' else start_price * (1.0 - slippage_pct / 100.0)
-
-    Q = 0.0
-    N = 0.0
-    for lvl in levels:
-        p, z = float(lvl['px']), float(lvl['sz'])
-        if z <= 0:
-            continue
-        # Check if taking the whole level crosses the target
-        avg_full = (N + p * z) / (Q + z)
-        crossed = (avg_full >= target) if side == 'asks' else (avg_full <= target)
+        crossed = (avg >= target_px) if side == 'asks' else (avg <= target_px)
         if crossed:
-            sol = solve_partial_at_target(N, Q, p, z, target)
-            x, N_star = sol
-            Q_star = Q + x
-            return Q_star, N_star, target
-        # Otherwise, consume whole level and continue
-        Q += z
-        N += p * z
-    return None
+            # Partial fill at this level to hit target
+            denom = (px - target_px)
+            if denom == 0:
+                break
+            x = (target_px * (cum_qty - sz) - (notional - px * sz)) / denom
+            notional_at_target = (notional - px * sz) + px * x
+            return notional_at_target, x + (cum_qty - sz), target_px
+    return notional, cum_qty, avg
 
 
-def load_snapshot_rows(csv_path: str, symbol: Optional[str] = None) -> pd.DataFrame:
-    df = pd.read_csv(csv_path, sep=';', usecols=['symbol', 'base_price', 'bids', 'asks'])
-    df['base_price'] = df['base_price'].apply(_normalize_number)
-    if symbol:
-        df = df[df['symbol'] == symbol].reset_index(drop=True)
-    return df
-
-
-def analyze_row(row: pd.Series, side: str, slippage_pct: float) -> Tuple[List[ImpactPoint], List[Dict[str, float]]]:
-    levels = parse_orderbook_blob(row['asks'] if side == 'asks' else row['bids'])
-    levels_sorted = sorted(levels, key=lambda d: d['px'], reverse=(side == 'bids'))
-    points = estimate_price_impact(levels_sorted, _normalize_number(row['base_price']), slippage_pct, side)
-    return points, levels_sorted
-
-
-def _build_cli() -> argparse.ArgumentParser:
+def main():
     p = argparse.ArgumentParser(description="Orderbook price-impact estimator")
     p.add_argument('--csv', required=True, help='Path to CSV file (semicolon-separated).')
     p.add_argument('--symbol', default=None, help='Filter by symbol.')
     p.add_argument('--side', choices=['asks', 'bids'], default='asks', help='Buy (asks) or sell (bids).')
-    p.add_argument('--slippage-pct', type=float, default=2.0, help='Target slippage percentage.')
-    p.add_argument('--row-index', type=int, default=0, help='Row index to analyze.')
-    return p
-
-
-def main():
-    args = _build_cli().parse_args()
-    df = load_snapshot_rows(args.csv, args.symbol)
+    p.add_argument('--max-impact-pct', type=float, required=True, help='Max tolerated price impact (percentage).')
+    p.add_argument('--usd-amount', type=float, default=None, help='Optional: USD amount to invest.')
+    p.add_argument('--row-index', type=int, default=None, help='Row index to analyze.')
+    p.add_argument('--all-rows', action='store_true', help='Process all rows for the symbol.')
+    p.add_argument('--excel-out', default=None, help='Path to output Excel file.')
+    args = p.parse_args()
+    df = pd.read_csv(args.csv, sep=',')
+    df = pd.read_csv(args.csv, sep=',', usecols=['ts', 'symbol', 'base_price', 'bids', 'asks'])
+    if args.symbol:
+        df = df[df['symbol'] == args.symbol].reset_index(drop=True)
     if df.empty:
         raise SystemExit("No matching rows found.")
-    row = df.iloc[max(0, min(args.row_index, len(df) - 1))]
 
-    points, levels_sorted = analyze_row(row, args.side, args.slippage_pct)
-    if not points:
-        print("No levels parsed or zero sizes.")
-        return
+    results = []
+    price_diff_list = []
+    investable_list = []
+    rows = df.iterrows() if args.all_rows else [(args.row_index if args.row_index is not None else 0, df.iloc[0])]
+    for idx, row in rows:
+        levels = parse_orderbook_blob(row['asks'] if args.side == 'asks' else row['bids'])
+        levels = sorted(levels, key=lambda d: d['px'], reverse=(args.side == 'bids'))
+        # Do not round base price, keep full precision
+        base_price_num = _normalize_number(row['base_price'])
+        notional, qty, avg_px = estimate_price_impact(levels, base_price_num, args.max_impact_pct, args.side)
+        try:
+            dt = pd.to_datetime(str(row['ts']))
+            time_str = dt.strftime('%H:%M')
+            day_str = str(dt.date())
+        except Exception:
+            time_str = ''
+            day_str = ''
+        price_diff = avg_px - base_price_num  # no rounding
+        if args.usd_amount is not None:
+            max_investable = round(min(notional, args.usd_amount), 3)
+        else:
+            max_investable = round(notional, 3)
+        side_str = 'Buy' if args.side == 'asks' else 'Sell'
+        price_diff_list.append(price_diff)
+        investable_list.append(max_investable)
+        result = {
+            'time': time_str,
+            'symbol': row['symbol'],
+            'side': side_str,
+            'base_price': base_price_num,  # full precision
+            'price_diff': price_diff,
+            'max_investable_usd': max_investable,
+            '_day': day_str
+        }
+        results.append(result)
+        if not args.all_rows:
+            print(f"\n=== Price Impact Result ===")
+            print(f"Symbol: {row['symbol']} | Side: {side_str} | Time: {time_str}")
+            print(f"Base price: {base_price_num:.3f} | Price diff: {price_diff:.3f} | Max investable USD: {max_investable:.3f}")
 
-    base_price_num = _normalize_number(row['base_price'])
-    direction = 'up' if args.side == 'asks' else 'down'
-    target_px = (base_price_num * (1 + args.slippage_pct/100)) if args.side == 'asks' else (base_price_num * (1 - args.slippage_pct/100))
+    # Calculate metric (out of 100) for each row
+    if args.all_rows and results:
+        price_diff_arr = pd.Series(price_diff_list)
+        investable_arr = pd.Series(investable_list)
+        if args.side == 'asks':  # Buy
+            price_score = 100 * (1 - (price_diff_arr - price_diff_arr.min()) / (price_diff_arr.max() - price_diff_arr.min() + 1e-9))
+        else:  # Sell
+            price_score = 100 * (price_diff_arr - price_diff_arr.min()) / (price_diff_arr.max() - price_diff_arr.min() + 1e-9)
+        invest_score = 100 * (investable_arr - investable_arr.min()) / (investable_arr.max() - investable_arr.min() + 1e-9)
+        metric = (price_score + invest_score) / 2
+        for i, m in enumerate(metric):
+            results[i]['best_time_metric'] = round(m, 1)
 
-    # Compute exact notional/qty at which the average equals target slippage
-    exact = exact_threshold_allocation(levels_sorted, base_price_num, args.slippage_pct, args.side)
+    # Save one Excel per day
+    if args.all_rows and args.excel_out:
+        import matplotlib.pyplot as plt
+        import os
 
-    print("\n=== Price Impact Summary ===")
-    print(f"Symbol: {row['symbol']} | Side: {args.side} | Start: {base_price_num:.6f} | Target avg {direction} to: {target_px:.6f}")
+        df_out = pd.DataFrame(results)
+        note = f"This Excel is for price impact: {args.max_impact_pct}"
 
-    last = points[-1]
-    print(f"Levels consumed: {len(points)} | Cumulative qty (last step): {last.cum_qty:.6f} | Average fill px (last step): {last.avg_px:.6f}")
+        for day, group in df_out.groupby('_day'):
+            group = group.drop(columns=['_day'])
+            excel_path = f"{os.path.splitext(args.excel_out)[0]}_{day}.xlsx"
+            # Create graphs for this day
 
-    print("\nImpact by notional (pre-threshold steps):")
-    for p in points:
-        # Only show pre-threshold steps; recompute threshold check
-        is_cross = (p.avg_px >= target_px) if args.side == 'asks' else (p.avg_px <= target_px)
-        if is_cross:
-            break
-        move_pct = ((p.avg_px / base_price_num) - 1.0) * 100.0
-        move_abs = p.avg_px - base_price_num
-        print(f"{p.notional:,.2f} USD → {move_pct:+.2f}% (avg {p.avg_px:.6f}, Δ ${move_abs:.6f})")
- 
-    if exact is not None:
-        qty_star, notional_star, avg_star = exact
-        move_pct_star = ((avg_star / base_price_num) - 1.0) * 100.0
-        move_abs_star = avg_star - base_price_num
-        print("\nMax notional at EXACT target slippage:")
-        print(f"{notional_star:,.2f} USD → {move_pct_star:+.2f}% (avg {avg_star:.6f}, Δ ${move_abs_star:.6f}, qty {qty_star:.6f})")
-    else:
-        print("\nThreshold not reached within available depth.")
-        
+            # Adapt y-axis for price_diff depending on max difference
+            plt.figure(figsize=(10, 6))
+            plt.plot(group['time'], group['price_diff'], marker='o')
+            plt.xticks(rotation=45)
+            plt.title('Price Diff Over Time')
+            plt.xlabel('Time')
+            plt.ylabel('Price Diff')
+            plt.tight_layout()
+            diff_min = group['price_diff'].min()
+            diff_max = group['price_diff'].max()
+            if abs(diff_max - diff_min) < 0.01:
+                plt.ylim(diff_min - 0.01, diff_max + 0.01)
+            else:
+                plt.ylim(diff_min - 0.1 * abs(diff_max - diff_min), diff_max + 0.1 * abs(diff_max - diff_min))
+            plt.savefig('price_diff_plot.png')
+
+            plt.figure(figsize=(10, 6))
+            plt.plot(group['time'], group['max_investable_usd'], marker='o', color='green')
+            plt.xticks(rotation=45)
+            plt.title('Max Investable USD Over Time')
+            plt.xlabel('Time')
+            plt.ylabel('Max Investable USD')
+            plt.tight_layout()
+            plt.savefig('max_investable_plot.png')
+
+            plt.figure(figsize=(10, 6))
+            plt.plot(group['time'], group['best_time_metric'], marker='o', color='purple')
+            plt.xticks(rotation=45)
+            plt.title('Best Time Metric Over Time')
+            plt.xlabel('Time')
+            plt.ylabel('Best Time Metric')
+            plt.tight_layout()
+            plt.savefig('best_time_metric_plot.png')
+
+            with pd.ExcelWriter(excel_path, engine='xlsxwriter') as writer:
+                pd.DataFrame([{'note': note}]).to_excel(writer, index=False, header=False, startrow=0)
+                group.to_excel(writer, index=False, startrow=2)
+                workbook = writer.book
+                worksheet = writer.sheets['Sheet1']
+                worksheet.insert_image('H2', 'price_diff_plot.png')
+                worksheet.insert_image('H22', 'max_investable_plot.png')
+                worksheet.insert_image('H42', 'best_time_metric_plot.png')
+            print(f"Results and graphs saved to {excel_path}")
+
 if __name__ == '__main__':
     main()
