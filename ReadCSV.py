@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """
+python3 ReadCSV.py --csv orderbook_snapshots.csv --side asks --max-impact-pct 1 --sep ,
+
 Orderbook Price-Impact Estimator (CSV-Optimized)
 
 - Parses a known CSV format: ts;symbol;base_price;bids;asks
@@ -207,5 +209,4 @@ def main():
             worksheet.insert_image('H42', 'best_time_metric_plot.png')
         print(f"Results and graphs saved to {excel_path}")
 if __name__ == '__main__':
-    main()_ == '__main__':
     main()
