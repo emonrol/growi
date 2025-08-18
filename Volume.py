@@ -1,21 +1,29 @@
 #!/usr/bin/env python3
 """
-Band-Volumes Around Base Price (Single Excel, Sheets by Currency)
+Band-Volumes Around Base Price (Single Excel, Sheets by Currency + Hourly Means & Plots on both sheets)
 
-Usage examples:
+Usage:
   python3 Volume.py --csv orderbook_snapshots_last_10000_ejemplo.csv --band-pct 0.05 --sep ";"
-  python3 Volume.py --csv data.csv --band-pct 1.0                  # defaults to sep=';'
 
 What it does:
-- Reads CSV with columns: ts;symbol;base_price;bids;asks
+- Reads CSV with columns: ts;symbol;base_price;bids;asks (semicolon-separated by default)
 - Cleans/normalizes:
     * decimal commas -> dots
     * messy JSON-ish blobs in bids/asks (quotes, semicolons, braces)
 - For each snapshot (row):
     * Up volume (asks): base_price <= px <= base_price*(1 + band_pct/100)
     * Down volume (bids): base_price*(1 - band_pct/100) <= px <= base_price
+- Adds:
+    * tz-naive Excel-safe 'timestamp'
+    * 'hour' column = timestamp floored to the hour (YYYY-MM-DD HH:00:00)
+    * Hourly means per (symbol, hour):
+        - hourly_up_volume_mean
+        - hourly_down_volume_mean
+      (mapped back to every row)
 - Creates ONE Excel workbook "Results_ByCurrency.xlsx"
-  with one sheet per symbol, sorted by timestamp (tz-naive, Excel-safe).
+  with:
+    * one main sheet per symbol (sorted by date/time, includes hourly means) + plot inserted
+    * one hourly summary sheet per symbol + the same plot inserted
 """
 
 from __future__ import annotations
@@ -24,13 +32,14 @@ import argparse
 import csv
 import json
 import re
-from typing import Iterable, List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional
+import os
 
 import pandas as pd
+import matplotlib.pyplot as plt
 
 # ------------------------ Parsing helpers ------------------------
 
-# Quote unquoted keys like {px: "4,77", sz: "43944,24"} -> {"px": "4,77", "sz": "43944,24"}
 _key_quote_pattern = re.compile(r'(?<=\{|,)\s*([A-Za-z_][A-Za-z0-9_]*)\s*:')
 
 def _quote_unquoted_keys(s: str) -> str:
@@ -55,10 +64,8 @@ def parse_orderbook_blob(blob: str) -> List[Dict[str, float]]:
     if not blob or (isinstance(blob, float) and pd.isna(blob)):
         return []
     s = str(blob).strip()
-    # Remove outer quotes if present
     if s.startswith('"') and s.endswith('"'):
         s = s[1:-1]
-    # Common cleanups
     s = s.replace('""', '"').replace(';', ',').replace('}{', '},{')
     s = _quote_unquoted_keys(s)
     if not s.startswith('['):
@@ -66,10 +73,8 @@ def parse_orderbook_blob(blob: str) -> List[Dict[str, float]]:
     try:
         raw = json.loads(s)
     except json.JSONDecodeError:
-        # Last-ditch: add commas between adjacent objects
         s2 = re.sub(r'}\s*{', '},{', s)
         raw = json.loads(s2)
-    # map to floats
     out = []
     for level in raw:
         px = _normalize_number(level.get('px'))
@@ -87,7 +92,6 @@ def _clean_ts_for_parsing(s: str) -> str:
     """
     Normalize '2025-08-09 15:26:17,243742+00' ->
               '2025-08-09 15:26:17.243742+00:00'
-    Also supports '+0000' -> '+00:00'.
     """
     if s is None:
         return ""
@@ -99,20 +103,17 @@ def _clean_ts_for_parsing(s: str) -> str:
 
 def parse_ts_naive_utc(s: str) -> Optional[pd.Timestamp]:
     """
-    Parse to a tz-aware UTC timestamp, then strip tz to make it Excel-safe (tz-naive).
-    Returns pandas NaT on failure.
+    Parse to tz-aware UTC, then strip tz to make Excel-safe (tz-naive).
     """
     cleaned = _clean_ts_for_parsing(s)
     ts = pd.to_datetime(cleaned, utc=True, errors='coerce')
     if pd.isna(ts):
         return pd.NaT
-    # convert to UTC (if needed) and strip tz
     try:
         if getattr(ts, 'tz', None) is not None:
             ts = ts.tz_convert('UTC')
         return ts.tz_localize(None)
     except Exception:
-        # If already tz-naive
         return ts
 
 # ------------------------ Band volume logic ------------------------
@@ -134,7 +135,7 @@ def sum_sizes_within_band(levels: List[Dict[str, float]], lower_px: float, upper
 def compute_up_down_volumes(base_price: float,
                             asks: List[Dict[str, float]],
                             bids: List[Dict[str, float]],
-                            band_pct: float) -> Tuple[float, float]:
+                            band_pct: float) -> tuple[float, float]:
     """
     Up volume (asks): base_price <= px <= base_price*(1 + band_pct/100)
     Down volume (bids): base_price*(1 - band_pct/100) <= px <= base_price
@@ -151,10 +152,6 @@ def compute_up_down_volumes(base_price: float,
 REQUIRED_COLS = {'ts', 'symbol', 'base_price', 'bids', 'asks'}
 
 def read_input_csv(path: str, sep_arg: Optional[str]) -> pd.DataFrame:
-    """
-    Reads CSV as text (dtype=str) so we can clean/parse later.
-    Defaults to sep=';' because your sample uses semicolons.
-    """
     sep = ';' if sep_arg is None else sep_arg
     df = pd.read_csv(path,
                      sep=sep,
@@ -169,7 +166,7 @@ def read_input_csv(path: str, sep_arg: Optional[str]) -> pd.DataFrame:
 # ------------------------ Main ------------------------
 
 def main():
-    ap = argparse.ArgumentParser(description="Compute up/down volumes within a percentage band around base price and export one Excel (sheets by currency).")
+    ap = argparse.ArgumentParser(description="Compute volumes in a band, add hourly means, export one Excel with plots (on main & hourly sheets).")
     ap.add_argument('--csv', required=True, help='Path to CSV file.')
     ap.add_argument('--band-pct', type=float, required=True, help='Percentage band, e.g. 0.05 for ±0.05%%.')
     ap.add_argument('--sep', default=';', help='CSV separator (default ;).')
@@ -185,25 +182,27 @@ def main():
     if df.empty:
         raise SystemExit("No matching rows found after filtering.")
 
-    # Parse an Excel-safe timestamp column (tz-naive)
-    df['timestamp'] = df['ts'].apply(parse_ts_naive_utc)
+    # Parse Excel-safe timestamp & derive hour bucket
+    df['timestamp'] = df['ts'].apply(parse_ts_naive_utc)   # tz-naive
+    df['hour'] = df['timestamp'].dt.floor('H')             # hourly bucket
 
-    # Compute volumes
+    # Compute volumes per row
     rows = []
     for _, row in df.iterrows():
         base_price = _normalize_number(row['base_price'])
         asks = parse_orderbook_blob(row['asks'])
         bids = parse_orderbook_blob(row['bids'])
 
-        # Sorting not necessary for band sums, but makes sense for sanity
+        # Not required for band sums, but tidy:
         asks = sorted(asks, key=lambda d: d['px'])
         bids = sorted(bids, key=lambda d: d['px'], reverse=True)
 
         up_vol, down_vol = compute_up_down_volumes(base_price, asks, bids, args.band_pct)
 
         rows.append({
-            'timestamp': row['timestamp'],       # tz-naive (Excel-safe)
-            'ts_raw': row['ts'],                 # original string, if you want to see it
+            'timestamp': row['timestamp'],   # tz-naive (Excel-safe)
+            'hour': row['hour'],             # hourly bucket
+            'ts_raw': row['ts'],
             'symbol': row['symbol'],
             'base_price': base_price,
             'band_pct': args.band_pct,
@@ -213,15 +212,57 @@ def main():
 
     out = pd.DataFrame(rows)
 
-    # Write ONE Excel: sheet per currency, sorted by date
-    excel_path = "Results_ByCurrency.xlsx"
+    # ---- Hourly means per (symbol, hour) ----
+    hourly = (
+        out.groupby(['symbol', 'hour'], as_index=False)
+           .agg(hourly_up_volume_mean=('up_volume_asks', 'mean'),
+                hourly_down_volume_mean=('down_volume_bids', 'mean'))
+    )
+
+    # Map hourly means back to each row as extra columns
+    out = out.merge(hourly, on=['symbol', 'hour'], how='left')
+
+    # ---- Excel output: one file, per-currency raw + per-currency hourly sheet ----
+    excel_path = "Results2.xlsx"
+    os.makedirs("plots", exist_ok=True)  # store plot images
+
     with pd.ExcelWriter(excel_path, engine='xlsxwriter') as writer:
         for sym, g in out.groupby('symbol'):
-            g_sorted = g.sort_values('timestamp', kind='mergesort')
-            sheet = (sym or 'UNKNOWN')[:31]   # Excel sheet name limit
-            g_sorted.to_excel(writer, sheet_name=sheet, index=False)
+            # 1) Main sheet per currency: rows sorted by time, includes hourly mean columns
+            g_sorted = g.sort_values(['hour', 'timestamp'], kind='mergesort')
+            sheet_main = (sym or 'UNKNOWN')[:31]
+            g_sorted.to_excel(writer, sheet_name=sheet_main, index=False)
 
-    print(f"Wrote {excel_path}")
+            # 2) Hourly summary sheet per currency
+            h = hourly[hourly['symbol'] == sym].sort_values('hour')
+            sheet_hourly = (f"Hourly_{sym}" if sym else "Hourly_UNKNOWN")[:31]
+            h.to_excel(writer, sheet_name=sheet_hourly, index=False)
+
+            # 3) Plot: hourly mean up/down volumes over time (SAME plot used on both sheets)
+            fig = plt.figure(figsize=(10, 6))
+            x = pd.to_datetime(h['hour'])
+            plt.plot(x, h['hourly_up_volume_mean'], marker='o', label='Hourly Up Volume (mean)')
+            plt.plot(x, h['hourly_down_volume_mean'], marker='o', label='Hourly Down Volume (mean)')
+            plt.title(f'{sym} — Hourly Mean Volumes (±{args.band_pct}%)')
+            plt.xlabel('Hour')
+            plt.ylabel('Volume (mean)')
+            plt.grid(True, alpha=0.3)
+            plt.legend()
+            plt.tight_layout()
+
+            plot_path = os.path.join("plots", f"{sym}_hourly_means.png")
+            fig.savefig(plot_path, dpi=150, bbox_inches='tight')
+            plt.close(fig)
+
+            # Insert into the hourly sheet
+            ws_hourly = writer.sheets[sheet_hourly]
+            ws_hourly.insert_image('H2', plot_path)
+
+            # ALSO insert the same plot into the main sheet
+            ws_main = writer.sheets[sheet_main]
+            ws_main.insert_image('J2', plot_path)
+
+    print(f"Wrote {excel_path} (plots inserted on both the main and hourly sheets per currency).")
 
 if __name__ == '__main__':
     main()
