@@ -1,29 +1,8 @@
 #!/usr/bin/env python3
 """
-Band-Volumes Around Base Price (Single Excel, Sheets by Currency + Hourly Means & Plots on both sheets)
-
-Usage:
   python3 Volume.py --csv orderbook_snapshots_last_10000_ejemplo.csv --band-pct 0.05 --sep ";"
+   * Up volume (asks): base_price <= px <= base_price*(1 + band_pct/100)
 
-What it does:
-- Reads CSV with columns: ts;symbol;base_price;bids;asks (semicolon-separated by default)
-- Cleans/normalizes:
-    * decimal commas -> dots
-    * messy JSON-ish blobs in bids/asks (quotes, semicolons, braces)
-- For each snapshot (row):
-    * Up volume (asks): base_price <= px <= base_price*(1 + band_pct/100)
-    * Down volume (bids): base_price*(1 - band_pct/100) <= px <= base_price
-- Adds:
-    * tz-naive Excel-safe 'timestamp'
-    * 'hour' column = timestamp floored to the hour (YYYY-MM-DD HH:00:00)
-    * Hourly means per (symbol, hour):
-        - hourly_up_volume_mean
-        - hourly_down_volume_mean
-      (mapped back to every row)
-- Creates ONE Excel workbook "Results_ByCurrency.xlsx"
-  with:
-    * one main sheet per symbol (sorted by date/time, includes hourly means) + plot inserted
-    * one hourly summary sheet per symbol + the same plot inserted
 """
 
 from __future__ import annotations
