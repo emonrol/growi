@@ -145,7 +145,7 @@ def read_input_csv(path: str, sep_arg: Optional[str]) -> pd.DataFrame:
 # ------------------------ Main ------------------------
 
 def main():
-    ap = argparse.ArgumentParser(description="Compute volumes in a band, add hourly means, export one Excel with plots (on main & hourly sheets).")
+    ap = argparse.ArgumentParser(description="Compute volumes in a band, export one Excel with all data and plots in main sheets.")
     ap.add_argument('--csv', required=True, help='Path to CSV file.')
     ap.add_argument('--band-pct', type=float, required=True, help='Percentage band, e.g. 0.05 for ±0.05%%.')
     ap.add_argument('--sep', default=';', help='CSV separator (default ;).')
@@ -161,9 +161,10 @@ def main():
     if df.empty:
         raise SystemExit("No matching rows found after filtering.")
 
-    # Parse Excel-safe timestamp & derive hour bucket
+    # Parse Excel-safe timestamp & derive hour bucket and date
     df['timestamp'] = df['ts'].apply(parse_ts_naive_utc)   # tz-naive
     df['hour'] = df['timestamp'].dt.floor('H')             # hourly bucket
+    df['date'] = df['timestamp'].dt.date                   # daily bucket
 
     # Compute volumes per row
     rows = []
@@ -181,6 +182,7 @@ def main():
         rows.append({
             'timestamp': row['timestamp'],   # tz-naive (Excel-safe)
             'hour': row['hour'],             # hourly bucket
+            'date': row['date'],             # daily bucket
             'ts_raw': row['ts'],
             'symbol': row['symbol'],
             'base_price': base_price,
@@ -198,50 +200,90 @@ def main():
                 hourly_down_volume_mean=('down_volume_bids', 'mean'))
     )
 
+    # ---- Daily means per (symbol, date) ----
+    daily = (
+        out.groupby(['symbol', 'date'], as_index=False)
+           .agg(daily_up_volume_mean=('up_volume_asks', 'mean'),
+                daily_down_volume_mean=('down_volume_bids', 'mean'))
+    )
+
     # Map hourly means back to each row as extra columns
     out = out.merge(hourly, on=['symbol', 'hour'], how='left')
+    
+    # Map daily means back to each row as extra columns
+    out = out.merge(daily, on=['symbol', 'date'], how='left')
 
-    # ---- Excel output: one file, per-currency raw + per-currency hourly sheet ----
-    excel_path = "Results2.xlsx"
+    # ---- Excel output: one file, main sheet per currency with all data and charts ----
+    excel_path = "Results.xlsx"
     os.makedirs("plots", exist_ok=True)  # store plot images
 
     with pd.ExcelWriter(excel_path, engine='xlsxwriter') as writer:
         for sym, g in out.groupby('symbol'):
-            # 1) Main sheet per currency: rows sorted by time, includes hourly mean columns
+            # Main sheet per currency: rows sorted by time, includes hourly mean columns
             g_sorted = g.sort_values(['hour', 'timestamp'], kind='mergesort')
             sheet_main = (sym or 'UNKNOWN')[:31]
             g_sorted.to_excel(writer, sheet_name=sheet_main, index=False)
 
-            # 2) Hourly summary sheet per currency
+            # Get hourly and daily data for this symbol
             h = hourly[hourly['symbol'] == sym].sort_values('hour')
-            sheet_hourly = (f"Hourly_{sym}" if sym else "Hourly_UNKNOWN")[:31]
-            h.to_excel(writer, sheet_name=sheet_hourly, index=False)
+            d = daily[daily['symbol'] == sym].sort_values('date')
 
-            # 3) Plot: hourly mean up/down volumes over time (SAME plot used on both sheets)
-            fig = plt.figure(figsize=(10, 6))
-            x = pd.to_datetime(h['hour'])
-            plt.plot(x, h['hourly_up_volume_mean'], marker='o', label='Hourly Up Volume (mean)')
-            plt.plot(x, h['hourly_down_volume_mean'], marker='o', label='Hourly Down Volume (mean)')
-            plt.title(f'{sym} — Hourly Mean Volumes (±{args.band_pct}%)')
-            plt.xlabel('Hour')
-            plt.ylabel('Volume (mean)')
-            plt.grid(True, alpha=0.3)
-            plt.legend()
-            plt.tight_layout()
+            # ---- Find the last day in the data ----
+            last_date = g['date'].max()
+            last_day_hourly = h[h['hour'].dt.date == last_date].copy()
 
-            plot_path = os.path.join("plots", f"{sym}_hourly_means.png")
-            fig.savefig(plot_path, dpi=150, bbox_inches='tight')
-            plt.close(fig)
+            # ---- Plot 1: Last day hourly means (24 hours) ----
+            if not last_day_hourly.empty:
+                fig1 = plt.figure(figsize=(12, 6))
+                x1 = pd.to_datetime(last_day_hourly['hour'])
+                plt.plot(x1, last_day_hourly['hourly_up_volume_mean'], marker='o', markersize=6, 
+                        label='Up Volume (mean)', linewidth=2)
+                plt.plot(x1, last_day_hourly['hourly_down_volume_mean'], marker='o', markersize=6, 
+                        label='Down Volume (mean)', linewidth=2)
+                plt.title(f'{sym} — Last Day Hourly Volumes ({last_date}) ±{args.band_pct}%')
+                plt.xlabel('Hour')
+                plt.ylabel('Volume (mean)')
+                plt.grid(True, alpha=0.3)
+                plt.legend()
+                plt.xticks(rotation=45)
+                plt.tight_layout()
 
-            # Insert into the hourly sheet
-            ws_hourly = writer.sheets[sheet_hourly]
-            ws_hourly.insert_image('H2', plot_path)
+                plot1_path = os.path.join("plots", f"{sym}_last_day_hourly.png")
+                fig1.savefig(plot1_path, dpi=150, bbox_inches='tight')
+                plt.close(fig1)
+            else:
+                plot1_path = None
 
-            # ALSO insert the same plot into the main sheet
+            # ---- Plot 2: Daily means across all days ----
+            if not d.empty:
+                fig2 = plt.figure(figsize=(12, 6))
+                x2 = pd.to_datetime(d['date'])
+                plt.plot(x2, d['daily_up_volume_mean'], marker='o', markersize=6, 
+                        label='Daily Up Volume (mean)', linewidth=2)
+                plt.plot(x2, d['daily_down_volume_mean'], marker='o', markersize=6, 
+                        label='Daily Down Volume (mean)', linewidth=2)
+                plt.title(f'{sym} — Daily Mean Volumes ±{args.band_pct}%')
+                plt.xlabel('Date')
+                plt.ylabel('Volume (mean)')
+                plt.grid(True, alpha=0.3)
+                plt.legend()
+                plt.xticks(rotation=45)
+                plt.tight_layout()
+
+                plot2_path = os.path.join("plots", f"{sym}_daily_means.png")
+                fig2.savefig(plot2_path, dpi=150, bbox_inches='tight')
+                plt.close(fig2)
+            else:
+                plot2_path = None
+
+            # Insert both plots into the main sheet only
             ws_main = writer.sheets[sheet_main]
-            ws_main.insert_image('J2', plot_path)
+            if plot1_path:
+                ws_main.insert_image('J2', plot1_path)
+            if plot2_path:
+                ws_main.insert_image('J25', plot2_path)
 
-    print(f"Wrote {excel_path} (plots inserted on both the main and hourly sheets per currency).")
+    print(f"Wrote {excel_path} ")
 
 if __name__ == '__main__':
     main()
