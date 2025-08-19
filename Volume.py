@@ -97,7 +97,7 @@ def parse_ts_naive_utc(s: str) -> Optional[pd.Timestamp]:
 
 # ------------------------ Band volume logic ------------------------
 
-def sum_sizes_within_band(levels: List[Dict[str, float]], lower_px: float, upper_px: float) -> float:
+def sum_values_within_band(levels: List[Dict[str, float]], lower_px: float, upper_px: float) -> float:
     """Sum 'sz' for levels where lower_px <= px <= upper_px."""
     if lower_px > upper_px:
         lower_px, upper_px = upper_px, lower_px
@@ -108,7 +108,7 @@ def sum_sizes_within_band(levels: List[Dict[str, float]], lower_px: float, upper
         if sz <= 0:
             continue
         if lower_px <= px <= upper_px:
-            total += sz
+            total += sz*px
     return total
 
 def compute_up_down_volumes(base_price: float,
@@ -122,8 +122,9 @@ def compute_up_down_volumes(base_price: float,
     bp = float(base_price)
     up_upper = bp * (1.0 + band_pct / 100.0)
     down_lower = bp * (1.0 - band_pct / 100.0)
-    up_volume = sum_sizes_within_band(asks, bp, up_upper)
-    down_volume = sum_sizes_within_band(bids, down_lower, bp)
+
+    up_volume = sum_values_within_band(asks, bp, up_upper)
+    down_volume = sum_values_within_band(bids, down_lower, bp)
     return up_volume, down_volume
 
 # ------------------------ CSV reading ------------------------
@@ -163,7 +164,7 @@ def main():
 
     # Parse Excel-safe timestamp & derive hour bucket and date
     df['timestamp'] = df['ts'].apply(parse_ts_naive_utc)   # tz-naive
-    df['hour'] = df['timestamp'].dt.floor('H')             # hourly bucket
+    df['hour'] = df['timestamp'].dt.floor('h')             # hourly bucket
     df['date'] = df['timestamp'].dt.date                   # daily bucket
 
     # Compute volumes per row
@@ -178,7 +179,6 @@ def main():
         bids = sorted(bids, key=lambda d: d['px'], reverse=True)
 
         up_vol, down_vol = compute_up_down_volumes(base_price, asks, bids, args.band_pct)
-
         rows.append({
             'timestamp': row['timestamp'],   # tz-naive (Excel-safe)
             'hour': row['hour'],             # hourly bucket
@@ -196,15 +196,15 @@ def main():
     # ---- Hourly means per (symbol, hour) ----
     hourly = (
         out.groupby(['symbol', 'hour'], as_index=False)
-           .agg(hourly_up_volume_mean=('up_volume_asks', 'mean'),
-                hourly_down_volume_mean=('down_volume_bids', 'mean'))
+           .agg(hourly_up_volume_usd_mean=('up_volume_asks', 'mean'),
+                hourly_down_volume_usd_mean=('down_volume_bids', 'mean'))
     )
 
     # ---- Daily means per (symbol, date) ----
     daily = (
         out.groupby(['symbol', 'date'], as_index=False)
-           .agg(daily_up_volume_mean=('up_volume_asks', 'mean'),
-                daily_down_volume_mean=('down_volume_bids', 'mean'))
+           .agg(daily_up_volume_usd_mean=('up_volume_asks', 'mean'),
+                daily_down_volume_usd_mean=('down_volume_bids', 'mean'))
     )
 
     # Map hourly means back to each row as extra columns
@@ -224,66 +224,44 @@ def main():
             sheet_main = (sym or 'UNKNOWN')[:31]
             g_sorted.to_excel(writer, sheet_name=sheet_main, index=False)
 
-            # Get hourly and daily data for this symbol
-            h = hourly[hourly['symbol'] == sym].sort_values('hour')
-            d = daily[daily['symbol'] == sym].sort_values('date')
+    # ---- Create plots ----
+    # Plot hourly means
+    for sym, h_group in hourly.groupby('symbol'):
+        plt.figure(figsize=(12, 6))
+        plt.plot(h_group['hour'], h_group['hourly_up_volume_usd_mean'], label='Up Volume USD', marker='o')
+        plt.plot(h_group['hour'], h_group['hourly_down_volume_usd_mean'], label='Down Volume USD', marker='s')
+        plt.xlabel('Hour')
+        plt.ylabel('Mean Volume (USD)')
+        plt.title(f'Mean Hourly Volume by Hour of Day ({sym})')
+        plt.legend()
+        plt.xticks(rotation=45)
+        plt.tight_layout()
+        
+        # Save plot
+        plot_path = f"plots/hourly_volume_{sym}.png"
+        plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+        print(f"Saved hourly plot: {plot_path}")
+        plt.show()
 
-            # ---- Find the last day in the data ----
-            last_date = g['date'].max()
-            last_day_hourly = h[h['hour'].dt.date == last_date].copy()
+    # Plot daily means
+    for sym, d_group in daily.groupby('symbol'):
+        plt.figure(figsize=(12, 6))
+        plt.plot(d_group['date'], d_group['daily_up_volume_usd_mean'], label='Up Volume USD', marker='o')
+        plt.plot(d_group['date'], d_group['daily_down_volume_usd_mean'], label='Down Volume USD', marker='s')
+        plt.xlabel('Date')
+        plt.ylabel('Mean Volume (USD)')
+        plt.title(f'Daily Mean Volume by Date ({sym})')
+        plt.legend()
+        plt.xticks(rotation=45)
+        plt.tight_layout()
+        
+        # Save plot
+        plot_path = f"plots/daily_volume_{sym}.png"
+        plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+        print(f"Saved daily plot: {plot_path}")
+        plt.show()
 
-            # ---- Plot 1: Last day hourly means (24 hours) ----
-            if not last_day_hourly.empty:
-                fig1 = plt.figure(figsize=(12, 6))
-                x1 = pd.to_datetime(last_day_hourly['hour'])
-                plt.plot(x1, last_day_hourly['hourly_up_volume_mean'], marker='o', markersize=6, 
-                        label='Up Volume (mean)', linewidth=2)
-                plt.plot(x1, last_day_hourly['hourly_down_volume_mean'], marker='o', markersize=6, 
-                        label='Down Volume (mean)', linewidth=2)
-                plt.title(f'{sym} — Last Day Hourly Volumes ({last_date}) ±{args.band_pct}%')
-                plt.xlabel('Hour')
-                plt.ylabel('Volume (mean)')
-                plt.grid(True, alpha=0.3)
-                plt.legend()
-                plt.xticks(rotation=45)
-                plt.tight_layout()
-
-                plot1_path = os.path.join("plots", f"{sym}_last_day_hourly.png")
-                fig1.savefig(plot1_path, dpi=150, bbox_inches='tight')
-                plt.close(fig1)
-            else:
-                plot1_path = None
-
-            # ---- Plot 2: Daily means across all days ----
-            if not d.empty:
-                fig2 = plt.figure(figsize=(12, 6))
-                x2 = pd.to_datetime(d['date'])
-                plt.plot(x2, d['daily_up_volume_mean'], marker='o', markersize=6, 
-                        label='Daily Up Volume (mean)', linewidth=2)
-                plt.plot(x2, d['daily_down_volume_mean'], marker='o', markersize=6, 
-                        label='Daily Down Volume (mean)', linewidth=2)
-                plt.title(f'{sym} — Daily Mean Volumes ±{args.band_pct}%')
-                plt.xlabel('Date')
-                plt.ylabel('Volume (mean)')
-                plt.grid(True, alpha=0.3)
-                plt.legend()
-                plt.xticks(rotation=45)
-                plt.tight_layout()
-
-                plot2_path = os.path.join("plots", f"{sym}_daily_means.png")
-                fig2.savefig(plot2_path, dpi=150, bbox_inches='tight')
-                plt.close(fig2)
-            else:
-                plot2_path = None
-
-            # Insert both plots into the main sheet only
-            ws_main = writer.sheets[sheet_main]
-            if plot1_path:
-                ws_main.insert_image('J2', plot1_path)
-            if plot2_path:
-                ws_main.insert_image('J25', plot2_path)
-
-    print(f"Wrote {excel_path} ")
+    print(f"Results saved to: {excel_path}")
 
 if __name__ == '__main__':
     main()
