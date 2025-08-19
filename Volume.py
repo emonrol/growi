@@ -213,6 +213,23 @@ def main():
     # Map daily means back to each row as extra columns
     out = out.merge(daily, on=['symbol', 'date'], how='left')
 
+    # Print processing statistics
+    total_days = out['date'].nunique()
+    total_records = len(out)
+    symbols_processed = out['symbol'].nunique()
+    
+    print(f"\n=== Processing Summary ===")
+    print(f"Total days processed: {total_days}")
+    print(f"Total records processed: {total_records}")
+    print(f"Symbols processed: {symbols_processed}")
+    
+    for sym in out['symbol'].unique():
+        sym_data = out[out['symbol'] == sym]
+        sym_days = sym_data['date'].nunique()
+        sym_records = len(sym_data)
+        print(f"  {sym}: {sym_days} days, {sym_records} records")
+    print("========================\n")
+
     # ---- Excel output: one file, main sheet per currency with all data and charts ----
     excel_path = "Results.xlsx"
     os.makedirs("plots", exist_ok=True)  # store plot images
@@ -224,17 +241,41 @@ def main():
             sheet_main = (sym or 'UNKNOWN')[:31]
             g_sorted.to_excel(writer, sheet_name=sheet_main, index=False)
 
+    # ---- Create aggregated data for plotting ----
+    
+    # Mean of hourly means by hour of day (across all days)
+    hourly['hour_of_day'] = hourly['hour'].dt.hour
+    hourly_by_hour = (
+        hourly.groupby(['symbol', 'hour_of_day'], as_index=False)
+              .agg(mean_up_volume_usd=('hourly_up_volume_usd_mean', 'mean'),
+                   mean_down_volume_usd=('hourly_down_volume_usd_mean', 'mean'))
+    )
+    
+    # Mean of daily means by day of week (across all weeks)  
+    daily['day_of_week'] = pd.to_datetime(daily['date']).dt.day_name()
+    daily_by_weekday = (
+        daily.groupby(['symbol', 'day_of_week'], as_index=False)
+             .agg(mean_up_volume_usd=('daily_up_volume_usd_mean', 'mean'),
+                  mean_down_volume_usd=('daily_down_volume_usd_mean', 'mean'))
+    )
+    
+    # Order days of week properly
+    day_order = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+    daily_by_weekday['day_of_week'] = pd.Categorical(daily_by_weekday['day_of_week'], categories=day_order, ordered=True)
+    daily_by_weekday = daily_by_weekday.sort_values(['symbol', 'day_of_week'])
+
     # ---- Create plots ----
-    # Plot hourly means
-    for sym, h_group in hourly.groupby('symbol'):
+    # Plot mean of hourly means by hour of day
+    for sym, h_group in hourly_by_hour.groupby('symbol'):
         plt.figure(figsize=(12, 6))
-        plt.plot(h_group['hour'], h_group['hourly_up_volume_usd_mean'], label='Up Volume USD', marker='o')
-        plt.plot(h_group['hour'], h_group['hourly_down_volume_usd_mean'], label='Down Volume USD', marker='s')
-        plt.xlabel('Hour')
-        plt.ylabel('Mean Volume (USD)')
-        plt.title(f'Mean Hourly Volume by Hour of Day ({sym})')
+        plt.plot(h_group['hour_of_day'], h_group['mean_up_volume_usd'], label='Up Volume USD', marker='o', linewidth=2)
+        plt.plot(h_group['hour_of_day'], h_group['mean_down_volume_usd'], label='Down Volume USD', marker='s', linewidth=2)
+        plt.xlabel('Hour of Day')
+        plt.ylabel('Mean of Hourly Means (USD)')
+        plt.title(f'Average Volume by Hour of Day ({sym})')
         plt.legend()
-        plt.xticks(rotation=45)
+        plt.grid(True, alpha=0.3)
+        plt.xticks(range(0, 24))
         plt.tight_layout()
         
         # Save plot
@@ -243,22 +284,23 @@ def main():
         print(f"Saved hourly plot: {plot_path}")
         plt.show()
 
-    # Plot daily means
-    for sym, d_group in daily.groupby('symbol'):
-        plt.figure(figsize=(12, 6))
-        plt.plot(d_group['date'], d_group['daily_up_volume_usd_mean'], label='Up Volume USD', marker='o')
-        plt.plot(d_group['date'], d_group['daily_down_volume_usd_mean'], label='Down Volume USD', marker='s')
-        plt.xlabel('Date')
-        plt.ylabel('Mean Volume (USD)')
-        plt.title(f'Daily Mean Volume by Date ({sym})')
+    # Plot mean of daily means by day of week
+    for sym, d_group in daily_by_weekday.groupby('symbol'):
+        plt.figure(figsize=(10, 6))
+        plt.plot(d_group['day_of_week'], d_group['mean_up_volume_usd'], label='Up Volume USD', marker='o', linewidth=2)
+        plt.plot(d_group['day_of_week'], d_group['mean_down_volume_usd'], label='Down Volume USD', marker='s', linewidth=2)
+        plt.xlabel('Day of Week')
+        plt.ylabel('Mean of Daily Means (USD)')
+        plt.title(f'Average Volume by Day of Week ({sym})')
         plt.legend()
+        plt.grid(True, alpha=0.3)
         plt.xticks(rotation=45)
         plt.tight_layout()
         
         # Save plot
-        plot_path = f"plots/daily_volume_{sym}.png"
+        plot_path = f"plots/weekly_volume_{sym}.png"
         plt.savefig(plot_path, dpi=150, bbox_inches='tight')
-        print(f"Saved daily plot: {plot_path}")
+        print(f"Saved weekly plot: {plot_path}")
         plt.show()
 
     print(f"Results saved to: {excel_path}")
