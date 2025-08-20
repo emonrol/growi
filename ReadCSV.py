@@ -14,47 +14,14 @@ Orderbook Price-Impact Estimator (CSV-Optimized)
 from __future__ import annotations
 
 import argparse
-import json
-import re
 from dataclasses import dataclass
-from typing import Iterable, List, Dict, Optional, Tuple
+from typing import Iterable, List, Dict, Tuple
 
 import pandas as pd
 import numpy as np
 
-_key_quote_pattern = re.compile(r"(?<=\{|,)\s*([A-Za-z_][A-Zael0-9_]*)\s*:")
-
-def _quote_unquoted_keys(s: str) -> str:
-    return re.sub(_key_quote_pattern, r'"\1":', s)
-
-def _normalize_number(x) -> float:
-    if isinstance(x, (int, float)):
-        return float(x)
-    s = str(x).strip().replace(",", ".").replace('"', '').replace("'", '')
-    try:
-        return float(s)
-    except ValueError:
-        m = re.search(r"[-+]?\d*\.?\d+", s)
-        return float(m.group(0)) if m else 0.0
-
-def parse_orderbook_blob(blob: str) -> List[Dict[str, float]]:
-    if not blob:
-        return []
-    s = str(blob).strip()
-    if s.startswith('"') and s.endswith('"'):
-        s = s[1:-1]
-    s = s.replace('""', '"').replace(';', ',').replace('}{', '},{')
-    s = _quote_unquoted_keys(s)
-    if not s.startswith('['):
-        s = f'[{s}]'
-    try:
-        raw = json.loads(s)
-    except json.JSONDecodeError:
-        raw = json.loads(re.sub(r'}\s*{', '},{', s))
-    return [{
-        'px': _normalize_number(level.get('px')), 
-        'sz': _normalize_number(level.get('sz'))
-    } for level in raw]
+# Import shared utilities
+from orderbook_utils import _normalize_number, parse_orderbook_blob
 
 @dataclass
 class ImpactPoint:
@@ -364,4 +331,5 @@ def main():
             print(f"Price impact range: {min(price_impacts):.3f}% - {max(price_impacts):.3f}%")
 
 if __name__ == '__main__':
+    main()
     main()

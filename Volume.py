@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import json
 import re
 from typing import List, Dict, Tuple, Optional
 import os
@@ -17,49 +16,8 @@ import os
 import pandas as pd
 import matplotlib.pyplot as plt
 
-# ------------------------ Parsing helpers ------------------------
-
-_key_quote_pattern = re.compile(r'(?<=\{|,)\s*([A-Za-z_][A-Za-z0-9_]*)\s*:')
-
-def _quote_unquoted_keys(s: str) -> str:
-    return re.sub(_key_quote_pattern, r'"\1":', s)
-
-def _normalize_number(x) -> float:
-    """Turn things like '4,77' or ' " 4,77 " ' into float 4.77; fallback to 0.0."""
-    if isinstance(x, (int, float)):
-        return float(x)
-    s = str(x).strip().replace(",", ".").replace('"', '').replace("'", '')
-    try:
-        return float(s)
-    except ValueError:
-        m = re.search(r"[-+]?\d*\.?\d+", s)
-        return float(m.group(0)) if m else 0.0
-
-def parse_orderbook_blob(blob: str) -> List[Dict[str, float]]:
-    """
-    Parse a messy bids/asks blob into a list of {'px': float, 'sz': float}.
-    Handles doubled quotes, semicolons as separators, glued objects, etc.
-    """
-    if not blob or (isinstance(blob, float) and pd.isna(blob)):
-        return []
-    s = str(blob).strip()
-    if s.startswith('"') and s.endswith('"'):
-        s = s[1:-1]
-    s = s.replace('""', '"').replace(';', ',').replace('}{', '},{')
-    s = _quote_unquoted_keys(s)
-    if not s.startswith('['):
-        s = f'[{s}]'
-    try:
-        raw = json.loads(s)
-    except json.JSONDecodeError:
-        s2 = re.sub(r'}\s*{', '},{', s)
-        raw = json.loads(s2)
-    out = []
-    for level in raw:
-        px = _normalize_number(level.get('px'))
-        sz = _normalize_number(level.get('sz'))
-        out.append({'px': px, 'sz': sz})
-    return out
+# Import shared utilities
+from orderbook_utils import _normalize_number, parse_orderbook_blob, validate_required_columns, REQUIRED_CSV_COLUMNS
 
 # ------------------------ Timestamp handling ------------------------
 
@@ -129,8 +87,6 @@ def compute_up_down_volumes(base_price: float,
 
 # ------------------------ CSV reading ------------------------
 
-REQUIRED_COLS = {'ts', 'symbol', 'base_price', 'bids', 'asks'}
-
 def read_input_csv(path: str, sep_arg: Optional[str]) -> pd.DataFrame:
     sep = ';' if sep_arg is None else sep_arg
     df = pd.read_csv(path,
@@ -138,9 +94,7 @@ def read_input_csv(path: str, sep_arg: Optional[str]) -> pd.DataFrame:
                      engine='python',
                      dtype=str,
                      quoting=csv.QUOTE_MINIMAL)
-    missing = REQUIRED_COLS.difference(df.columns)
-    if missing:
-        raise SystemExit(f"CSV is missing required columns: {sorted(missing)}")
+    validate_required_columns(df.columns, REQUIRED_CSV_COLUMNS)
     return df[['ts', 'symbol', 'base_price', 'bids', 'asks']].copy()
 
 # ------------------------ Main ------------------------
