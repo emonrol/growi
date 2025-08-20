@@ -200,12 +200,14 @@ def main():
     # Mean and median of hourly means by hour of day (across all days)
     hourly['hour_of_day'] = hourly['hour'].dt.hour
     hourly_by_hour = (
-        hourly.groupby(['symbol', 'hour_of_day'], as_index=False)
-              .agg(mean_up_volume_usd=('hourly_up_volume_usd_mean', 'mean'),
-                   mean_down_volume_usd=('hourly_down_volume_usd_mean', 'mean'),
-                   median_up_volume_usd=('hourly_up_volume_usd_mean', 'median'),
-                   median_down_volume_usd=('hourly_down_volume_usd_mean', 'median'))
-    )
+    hourly.groupby(['symbol', 'hour_of_day'], as_index=False)
+          .agg(mean_up_volume_usd=('hourly_up_volume_usd_mean', 'mean'),
+               median_up_volume_usd=('hourly_up_volume_usd_mean', 'median'),
+               up_volume_usd_p25=('hourly_up_volume_usd_mean', lambda x: x.quantile(0.25)),
+               mean_down_volume_usd=('hourly_down_volume_usd_mean', 'mean'),
+               median_down_volume_usd=('hourly_down_volume_usd_mean', 'median'),
+               down_volume_usd_p25=('hourly_down_volume_usd_mean', lambda x: x.quantile(0.25)))
+)
     
     # Mean of daily means by day of week (across all weeks)  
     daily['day_of_week'] = pd.to_datetime(daily['date']).dt.day_name()
@@ -225,22 +227,27 @@ def main():
     for sym, h_group in hourly_by_hour.groupby('symbol'):
         plt.figure(figsize=(12, 6))
         
-        # Ask volume - mean and median
+        # Ask volume - mean, median, and 25th percentile
         plt.plot(h_group['hour_of_day'], h_group['mean_up_volume_usd'], 
                 label='Ask Mean', marker='o', linewidth=2.5, color='#2ca02c')
         plt.plot(h_group['hour_of_day'], h_group['median_up_volume_usd'], 
                 label='Ask Median', marker='s', linewidth=2, color='#2ca02c', linestyle='--', alpha=0.8)
+        plt.plot(h_group['hour_of_day'], h_group['up_volume_usd_p25'], 
+                label='Ask 25th Percentile', marker='^', linewidth=1.5, color='#2ca02c', linestyle=':', alpha=0.6)
         
-        # Bid volume - mean and median
+        # Bid volume - mean, median, and 25th percentile
         plt.plot(h_group['hour_of_day'], h_group['mean_down_volume_usd'], 
                 label='Bid Mean', marker='o', linewidth=2.5, color='#d62728')
         plt.plot(h_group['hour_of_day'], h_group['median_down_volume_usd'], 
                 label='Bid Median', marker='s', linewidth=2, color='#d62728', linestyle='--', alpha=0.8)
-        
+        plt.plot(h_group['hour_of_day'], h_group['down_volume_usd_p25'], 
+                label='Bid 25th Percentile', marker='^', linewidth=1.5, color='#d62728', linestyle=':', alpha=0.6)
+    
         plt.xlabel('Hour of Day (UTC time +00)')
         plt.ylabel('Volume (USD)')
         plt.title(f'Mean vs Median Hourly Volume by Hour of Day - {sym} ({total_days} days) with a {args.band_pct}% band')
         plt.legend()
+        plt.ylim(0, 1e4)  # Set y-axis limits to 0-1e4
         plt.grid(True, alpha=0.3)
         plt.xticks(range(0, 24))
         plt.tight_layout()
@@ -260,6 +267,7 @@ def main():
         plt.ylabel('Mean of Daily Means (USD)')
         plt.title(f'Average Volume by Day of Week ({sym}) ({total_days} days) with a {args.band_pct}% band')
         plt.legend()
+        plt.ylim(0, 1e4)  # Set y-axis limits to 0-1e4
         plt.grid(True, alpha=0.3)
         plt.xticks(rotation=45)
         plt.tight_layout()
