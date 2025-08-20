@@ -105,6 +105,7 @@ def main():
     ap.add_argument('--band-pct', type=float, required=True, help='Percentage band, e.g. 0.05 for ±0.05%%.')
     ap.add_argument('--sep', default=';', help='CSV separator (default ;).')
     ap.add_argument('--symbol', default=None, help='Optional: filter to one symbol.')
+    ap.add_argument('--sci-scale', type=int, default=4, help='Scientific notation scale exponent (default: 4 for 1e4).')
     args = ap.parse_args()
 
     # Read CSV (as strings)
@@ -133,6 +134,7 @@ def main():
         bids = sorted(bids, key=lambda d: d['px'], reverse=True)
 
         up_vol, down_vol = compute_up_down_volumes(base_price, asks, bids, args.band_pct)
+        
         rows.append({
             'timestamp': row['timestamp'],   # tz-naive (Excel-safe)
             'hour': row['hour'],             # hourly bucket
@@ -176,6 +178,7 @@ def main():
     print(f"Total days processed: {total_days}")
     print(f"Total records processed: {total_records}")
     print(f"Symbols processed: {symbols_processed}")
+    print(f"Scientific notation scale: 1e{args.sci_scale}")
     
     for sym in out['symbol'].unique():
         sym_data = out[out['symbol'] == sym]
@@ -222,7 +225,8 @@ def main():
     daily_by_weekday['day_of_week'] = pd.Categorical(daily_by_weekday['day_of_week'], categories=day_order, ordered=True)
     daily_by_weekday = daily_by_weekday.sort_values(['symbol', 'day_of_week'])
 
-    # ---- Create plots ----
+    # ---- Create plots with consistent scientific notation scale ----
+    
     # Plot mean and median together in single plot
     for sym, h_group in hourly_by_hour.groupby('symbol'):
         plt.figure(figsize=(12, 6))
@@ -248,6 +252,9 @@ def main():
         plt.title(f'Mean vs Median Hourly Volume by Hour of Day - {sym} ({total_days} days) with a {args.band_pct}% band')
         plt.legend()
 
+        # Force consistent scientific notation scale
+        plt.ticklabel_format(style='scientific', axis='y', scilimits=(args.sci_scale, args.sci_scale))
+        
         plt.grid(True, alpha=0.3)
         plt.xticks(range(0, 24))
         plt.tight_layout()
@@ -267,6 +274,10 @@ def main():
         plt.ylabel('Mean of Daily Means (USD)')
         plt.title(f'Average Volume by Day of Week ({sym}) ({total_days} days) with a {args.band_pct}% band')
         plt.legend()
+        
+        # Force consistent scientific notation scale
+        plt.ticklabel_format(style='scientific', axis='y', scilimits=(args.sci_scale, args.sci_scale))
+        
         plt.grid(True, alpha=0.3)
         plt.xticks(rotation=45)
         plt.tight_layout()
