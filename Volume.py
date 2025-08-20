@@ -247,7 +247,7 @@ def main():
         plt.ylabel('Volume (USD)')
         plt.title(f'Mean vs Median Hourly Volume by Hour of Day - {sym} ({total_days} days) with a {args.band_pct}% band')
         plt.legend()
-        plt.ylim(0, 1e4)  # Set y-axis limits to 0-1e4
+
         plt.grid(True, alpha=0.3)
         plt.xticks(range(0, 24))
         plt.tight_layout()
@@ -267,7 +267,6 @@ def main():
         plt.ylabel('Mean of Daily Means (USD)')
         plt.title(f'Average Volume by Day of Week ({sym}) ({total_days} days) with a {args.band_pct}% band')
         plt.legend()
-        plt.ylim(0, 1e4)  # Set y-axis limits to 0-1e4
         plt.grid(True, alpha=0.3)
         plt.xticks(rotation=45)
         plt.tight_layout()
