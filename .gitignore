@@ -1,4 +1,5 @@
 *
 !orderbook_utils.py
+!volatility.py
 !ReadCSV.py
 !Volume.py
