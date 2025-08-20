@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-  python3 Volume.py --csv orderbook_snapshots_last_10000_ejemplo.csv --band-pct 0.05 --sep ";"
+  python3 Volume.py --csv orderbook_snapshots_last_10000_ejemplo.csv --band-pct 5 --sep ";"
    * Up volume (asks): base_price <= px <= base_price*(1 + band_pct/100)
 
 """
@@ -243,12 +243,14 @@ def main():
 
     # ---- Create aggregated data for plotting ----
     
-    # Mean of hourly means by hour of day (across all days)
+    # Mean and median of hourly means by hour of day (across all days)
     hourly['hour_of_day'] = hourly['hour'].dt.hour
     hourly_by_hour = (
         hourly.groupby(['symbol', 'hour_of_day'], as_index=False)
               .agg(mean_up_volume_usd=('hourly_up_volume_usd_mean', 'mean'),
-                   mean_down_volume_usd=('hourly_down_volume_usd_mean', 'mean'))
+                   mean_down_volume_usd=('hourly_down_volume_usd_mean', 'mean'),
+                   median_up_volume_usd=('hourly_up_volume_usd_mean', 'median'),
+                   median_down_volume_usd=('hourly_down_volume_usd_mean', 'median'))
     )
     
     # Mean of daily means by day of week (across all weeks)  
@@ -265,33 +267,44 @@ def main():
     daily_by_weekday = daily_by_weekday.sort_values(['symbol', 'day_of_week'])
 
     # ---- Create plots ----
-    # Plot mean of hourly means by hour of day
+    # Plot mean and median together in single plot
     for sym, h_group in hourly_by_hour.groupby('symbol'):
         plt.figure(figsize=(12, 6))
-        plt.plot(h_group['hour_of_day'], h_group['mean_up_volume_usd'], label='Up Volume USD', marker='o', linewidth=2)
-        plt.plot(h_group['hour_of_day'], h_group['mean_down_volume_usd'], label='Down Volume USD', marker='s', linewidth=2)
-        plt.xlabel('Hour of Day')
-        plt.ylabel('Mean of Hourly Means (USD)')
-        plt.title(f'Average Volume by Hour of Day ({sym})')
+        
+        # Ask volume - mean and median
+        plt.plot(h_group['hour_of_day'], h_group['mean_up_volume_usd'], 
+                label='Ask Mean', marker='o', linewidth=2.5, color='#2ca02c')
+        plt.plot(h_group['hour_of_day'], h_group['median_up_volume_usd'], 
+                label='Ask Median', marker='s', linewidth=2, color='#2ca02c', linestyle='--', alpha=0.8)
+        
+        # Bid volume - mean and median
+        plt.plot(h_group['hour_of_day'], h_group['mean_down_volume_usd'], 
+                label='Bid Mean', marker='o', linewidth=2.5, color='#d62728')
+        plt.plot(h_group['hour_of_day'], h_group['median_down_volume_usd'], 
+                label='Bid Median', marker='s', linewidth=2, color='#d62728', linestyle='--', alpha=0.8)
+        
+        plt.xlabel('Hour of Day (UTC time +00)')
+        plt.ylabel('Volume (USD)')
+        plt.title(f'Mean vs Median Hourly Volume by Hour of Day - {sym} ({total_days} days) with a {args.band_pct}% band')
         plt.legend()
         plt.grid(True, alpha=0.3)
         plt.xticks(range(0, 24))
         plt.tight_layout()
         
         # Save plot
-        plot_path = f"plots/hourly_volume_{sym}.png"
+        plot_path = f"plots/hourly_volume_mean_median_{sym}.png"
         plt.savefig(plot_path, dpi=150, bbox_inches='tight')
-        print(f"Saved hourly plot: {plot_path}")
+        print(f"Saved hourly mean/median plot: {plot_path}")
         plt.show()
 
     # Plot mean of daily means by day of week
     for sym, d_group in daily_by_weekday.groupby('symbol'):
         plt.figure(figsize=(10, 6))
-        plt.plot(d_group['day_of_week'], d_group['mean_up_volume_usd'], label='Up Volume USD', marker='o', linewidth=2)
-        plt.plot(d_group['day_of_week'], d_group['mean_down_volume_usd'], label='Down Volume USD', marker='s', linewidth=2)
+        plt.plot(d_group['day_of_week'], d_group['mean_up_volume_usd'], label='Ask Volume USD', marker='o', linewidth=2)
+        plt.plot(d_group['day_of_week'], d_group['mean_down_volume_usd'], label='Bid Volume USD', marker='s', linewidth=2)
         plt.xlabel('Day of Week')
         plt.ylabel('Mean of Daily Means (USD)')
-        plt.title(f'Average Volume by Day of Week ({sym})')
+        plt.title(f'Average Volume by Day of Week ({sym}) ({total_days} days) with a {args.band_pct}% band')
         plt.legend()
         plt.grid(True, alpha=0.3)
         plt.xticks(rotation=45)
