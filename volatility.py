@@ -38,22 +38,23 @@ def calculate_log_returns(prices: pd.Series) -> pd.Series:
     return log_returns.dropna()
 
 
-def parse_orderbook_levels(orderbook_str: str) -> List[float]:
+def parse_orderbook_levels(orderbook_str: str) -> Tuple[List[float], List[float]]:
     """
-    Parse orderbook JSON string and extract all price levels.
+    Parse orderbook JSON string and extract all price levels and quantities.
     
     Args:
         orderbook_str: JSON string containing orderbook data
         
     Returns:
-        List of all price levels (floats)
+        Tuple of (prices, quantities) as lists of floats
     """
     try:
         orderbook = json.loads(orderbook_str)
         prices = [float(level["px"]) for level in orderbook]
-        return prices
+        quantities = [float(level["sz"]) for level in orderbook]
+        return prices, quantities
     except (json.JSONDecodeError, KeyError, ValueError):
-        return []
+        return [], []
 
 
 def calculate_volatility_metrics(log_returns: pd.Series) -> Dict[str, float]:
@@ -164,13 +165,15 @@ def analyze_csv_volatility(csv_path: str, symbol_filters: Optional[list] = None)
         # Parse orderbook data for levels (get latest snapshot)
         latest_row = symbol_data.iloc[-1]
         bid_levels = []
+        bid_quantities = []
         ask_levels = []
+        ask_quantities = []
         
         if 'bids' in symbol_data.columns and pd.notna(latest_row['bids']):
-            bid_levels = parse_orderbook_levels(latest_row['bids'])
+            bid_levels, bid_quantities = parse_orderbook_levels(latest_row['bids'])
         
         if 'asks' in symbol_data.columns and pd.notna(latest_row['asks']):
-            ask_levels = parse_orderbook_levels(latest_row['asks'])
+            ask_levels, ask_quantities = parse_orderbook_levels(latest_row['asks'])
         
         results[symbol] = {
             'volatility_metrics': vol_metrics,
@@ -183,7 +186,9 @@ def analyze_csv_volatility(csv_path: str, symbol_filters: Optional[list] = None)
             },
             'orderbook_levels': {
                 'bid_levels': bid_levels,
-                'ask_levels': ask_levels
+                'bid_quantities': bid_quantities,
+                'ask_levels': ask_levels,
+                'ask_quantities': ask_quantities
             },
             'data_quality': {
                 'total_observations': len(prices),
@@ -203,7 +208,7 @@ def create_excel_volatility_tables(results: Dict, output_filename: str = "volati
     3. Sell Target Prices
     4. Orderbook Levels Analysis - Bid and Ask tables using actual orderbook prices
     
-    Formula for Table 4: level_price/base_price*100 where level_price comes from actual bids/asks data
+    Table 4 has 5 columns per asset: % Difference, Quantity, USD Value, Accumulated Qty, Accumulated USD
     
     Args:
         results: Results from analyze_csv_volatility()
@@ -410,44 +415,109 @@ def create_excel_volatility_tables(results: Dict, output_filename: str = "volati
     worksheet.cell(row=current_row, column=1).font = Font(bold=True, color="008000")  # Green
     current_row += 1
     
-    # Headers for bid levels
+    # Headers for bid levels - 5 columns per symbol
     worksheet.cell(row=current_row, column=1, value="Level")
     worksheet.cell(row=current_row, column=1).font = header_font
     worksheet.cell(row=current_row, column=1).fill = header_fill
     worksheet.cell(row=current_row, column=1).alignment = cell_alignment
     
-    for col_idx, symbol in enumerate(symbols, start=2):
-        worksheet.cell(row=current_row, column=col_idx, value=f"{symbol}")
+    col_idx = 2
+    for symbol in symbols:
+        # Column 1: Percentage
+        worksheet.cell(row=current_row, column=col_idx, value=f"{symbol} %")
         worksheet.cell(row=current_row, column=col_idx).font = header_font
         worksheet.cell(row=current_row, column=col_idx).fill = header_fill
         worksheet.cell(row=current_row, column=col_idx).alignment = cell_alignment
+        
+        # Column 2: Quantity
+        worksheet.cell(row=current_row, column=col_idx + 1, value=f"{symbol} Qty")
+        worksheet.cell(row=current_row, column=col_idx + 1).font = header_font
+        worksheet.cell(row=current_row, column=col_idx + 1).fill = header_fill
+        worksheet.cell(row=current_row, column=col_idx + 1).alignment = cell_alignment
+        
+        # Column 3: USD Value
+        worksheet.cell(row=current_row, column=col_idx + 2, value=f"{symbol} USD")
+        worksheet.cell(row=current_row, column=col_idx + 2).font = header_font
+        worksheet.cell(row=current_row, column=col_idx + 2).fill = header_fill
+        worksheet.cell(row=current_row, column=col_idx + 2).alignment = cell_alignment
+        
+        # Column 4: Accumulated Quantity
+        worksheet.cell(row=current_row, column=col_idx + 3, value=f"{symbol} Acc Qty")
+        worksheet.cell(row=current_row, column=col_idx + 3).font = header_font
+        worksheet.cell(row=current_row, column=col_idx + 3).fill = header_fill
+        worksheet.cell(row=current_row, column=col_idx + 3).alignment = cell_alignment
+        
+        # Column 5: Accumulated USD
+        worksheet.cell(row=current_row, column=col_idx + 4, value=f"{symbol} Acc USD")
+        worksheet.cell(row=current_row, column=col_idx + 4).font = header_font
+        worksheet.cell(row=current_row, column=col_idx + 4).fill = header_fill
+        worksheet.cell(row=current_row, column=col_idx + 4).alignment = cell_alignment
+        
+        col_idx += 5  # Move to next symbol's columns
     
     current_row += 1
     
     # Data rows for bid levels - using actual orderbook bid prices (all levels)
     max_bid_levels = max([len(results[symbol]['orderbook_levels']['bid_levels']) for symbol in symbols]) if symbols else 0
     
+    # Initialize accumulators for each symbol
+    symbol_accumulators = {}
+    for symbol in symbols:
+        symbol_accumulators[symbol] = {'qty': 0.0, 'usd': 0.0}
+    
     for level in range(1, max_bid_levels + 1):
         worksheet.cell(row=current_row, column=1, value=level)
         worksheet.cell(row=current_row, column=1).alignment = cell_alignment
         worksheet.cell(row=current_row, column=1).font = Font(bold=True)
         
-        for col_idx, symbol in enumerate(symbols, start=2):
+        col_idx = 2
+        for symbol in symbols:
             base_price = results[symbol]['price_stats']['latest_price']
             bid_levels = results[symbol]['orderbook_levels']['bid_levels']
+            bid_quantities = results[symbol]['orderbook_levels']['bid_quantities']
             
             if level <= len(bid_levels):
                 level_price = bid_levels[level - 1]  # level 1 = index 0
-                # Calculate percentage difference: (level_price/base_price*100) - 100
-                pct_diff = (level_price / base_price * 100) - 100
+                level_quantity = bid_quantities[level - 1]
+                usd_value = level_quantity * level_price
                 
+                # Update accumulators
+                symbol_accumulators[symbol]['qty'] += level_quantity
+                symbol_accumulators[symbol]['usd'] += usd_value
+                
+                # Column 1: Percentage difference
+                pct_diff = (level_price / base_price * 100) - 100
                 cell = worksheet.cell(row=current_row, column=col_idx, value=round(pct_diff, 3))
                 cell.alignment = cell_alignment
-                cell.fill = positive_fill  # Light green background
-            else:
-                # No data for this level
-                cell = worksheet.cell(row=current_row, column=col_idx, value="N/A")
+                cell.fill = positive_fill
+                
+                # Column 2: Quantity in asset currency
+                cell = worksheet.cell(row=current_row, column=col_idx + 1, value=round(level_quantity, 6))
                 cell.alignment = cell_alignment
+                cell.fill = positive_fill
+                
+                # Column 3: USD value (quantity * price)
+                cell = worksheet.cell(row=current_row, column=col_idx + 2, value=round(usd_value, 2))
+                cell.alignment = cell_alignment
+                cell.fill = positive_fill
+                
+                # Column 4: Accumulated quantity
+                cell = worksheet.cell(row=current_row, column=col_idx + 3, value=round(symbol_accumulators[symbol]['qty'], 6))
+                cell.alignment = cell_alignment
+                cell.fill = positive_fill
+                
+                # Column 5: Accumulated USD
+                cell = worksheet.cell(row=current_row, column=col_idx + 4, value=round(symbol_accumulators[symbol]['usd'], 2))
+                cell.alignment = cell_alignment
+                cell.fill = positive_fill
+                
+            else:
+                # No data for this level - fill all 5 columns with N/A
+                for i in range(5):
+                    cell = worksheet.cell(row=current_row, column=col_idx + i, value="N/A")
+                    cell.alignment = cell_alignment
+            
+            col_idx += 5  # Move to next symbol's columns
         
         current_row += 1
     
@@ -458,52 +528,123 @@ def create_excel_volatility_tables(results: Dict, output_filename: str = "volati
     worksheet.cell(row=current_row, column=1).font = Font(bold=True, color="CC0000")  # Red
     current_row += 1
     
-    # Headers for ask levels
+    # Headers for ask levels - 5 columns per symbol
     worksheet.cell(row=current_row, column=1, value="Level")
     worksheet.cell(row=current_row, column=1).font = header_font
     worksheet.cell(row=current_row, column=1).fill = header_fill
     worksheet.cell(row=current_row, column=1).alignment = cell_alignment
     
-    for col_idx, symbol in enumerate(symbols, start=2):
-        worksheet.cell(row=current_row, column=col_idx, value=f"{symbol}")
+    col_idx = 2
+    for symbol in symbols:
+        # Column 1: Percentage
+        worksheet.cell(row=current_row, column=col_idx, value=f"{symbol} %")
         worksheet.cell(row=current_row, column=col_idx).font = header_font
         worksheet.cell(row=current_row, column=col_idx).fill = header_fill
         worksheet.cell(row=current_row, column=col_idx).alignment = cell_alignment
+        
+        # Column 2: Quantity
+        worksheet.cell(row=current_row, column=col_idx + 1, value=f"{symbol} Qty")
+        worksheet.cell(row=current_row, column=col_idx + 1).font = header_font
+        worksheet.cell(row=current_row, column=col_idx + 1).fill = header_fill
+        worksheet.cell(row=current_row, column=col_idx + 1).alignment = cell_alignment
+        
+        # Column 3: USD Value
+        worksheet.cell(row=current_row, column=col_idx + 2, value=f"{symbol} USD")
+        worksheet.cell(row=current_row, column=col_idx + 2).font = header_font
+        worksheet.cell(row=current_row, column=col_idx + 2).fill = header_fill
+        worksheet.cell(row=current_row, column=col_idx + 2).alignment = cell_alignment
+        
+        # Column 4: Accumulated Quantity
+        worksheet.cell(row=current_row, column=col_idx + 3, value=f"{symbol} Acc Qty")
+        worksheet.cell(row=current_row, column=col_idx + 3).font = header_font
+        worksheet.cell(row=current_row, column=col_idx + 3).fill = header_fill
+        worksheet.cell(row=current_row, column=col_idx + 3).alignment = cell_alignment
+        
+        # Column 5: Accumulated USD
+        worksheet.cell(row=current_row, column=col_idx + 4, value=f"{symbol} Acc USD")
+        worksheet.cell(row=current_row, column=col_idx + 4).font = header_font
+        worksheet.cell(row=current_row, column=col_idx + 4).fill = header_fill
+        worksheet.cell(row=current_row, column=col_idx + 4).alignment = cell_alignment
+        
+        col_idx += 5  # Move to next symbol's columns
     
     current_row += 1
     
     # Data rows for ask levels - using actual orderbook ask prices (all levels)
     max_ask_levels = max([len(results[symbol]['orderbook_levels']['ask_levels']) for symbol in symbols]) if symbols else 0
     
+    # Reset accumulators for ask levels
+    symbol_accumulators = {}
+    for symbol in symbols:
+        symbol_accumulators[symbol] = {'qty': 0.0, 'usd': 0.0}
+    
     for level in range(1, max_ask_levels + 1):
         worksheet.cell(row=current_row, column=1, value=level)
         worksheet.cell(row=current_row, column=1).alignment = cell_alignment
         worksheet.cell(row=current_row, column=1).font = Font(bold=True)
         
-        for col_idx, symbol in enumerate(symbols, start=2):
+        col_idx = 2
+        for symbol in symbols:
             base_price = results[symbol]['price_stats']['latest_price']
             ask_levels = results[symbol]['orderbook_levels']['ask_levels']
+            ask_quantities = results[symbol]['orderbook_levels']['ask_quantities']
             
             if level <= len(ask_levels):
                 level_price = ask_levels[level - 1]  # level 1 = index 0
-                # Calculate percentage difference: (level_price/base_price*100) - 100
-                pct_diff = (level_price / base_price * 100) - 100
+                level_quantity = ask_quantities[level - 1]
+                usd_value = level_quantity * level_price
                 
+                # Update accumulators
+                symbol_accumulators[symbol]['qty'] += level_quantity
+                symbol_accumulators[symbol]['usd'] += usd_value
+                
+                # Column 1: Percentage difference
+                pct_diff = (level_price / base_price * 100) - 100
                 cell = worksheet.cell(row=current_row, column=col_idx, value=round(pct_diff, 3))
                 cell.alignment = cell_alignment
-                cell.fill = negative_fill  # Light red background
-            else:
-                # No data for this level
-                cell = worksheet.cell(row=current_row, column=col_idx, value="N/A")
+                cell.fill = negative_fill
+                
+                # Column 2: Quantity in asset currency
+                cell = worksheet.cell(row=current_row, column=col_idx + 1, value=round(level_quantity, 6))
                 cell.alignment = cell_alignment
+                cell.fill = negative_fill
+                
+                # Column 3: USD value (quantity * price)
+                cell = worksheet.cell(row=current_row, column=col_idx + 2, value=round(usd_value, 2))
+                cell.alignment = cell_alignment
+                cell.fill = negative_fill
+                
+                # Column 4: Accumulated quantity
+                cell = worksheet.cell(row=current_row, column=col_idx + 3, value=round(symbol_accumulators[symbol]['qty'], 6))
+                cell.alignment = cell_alignment
+                cell.fill = negative_fill
+                
+                # Column 5: Accumulated USD
+                cell = worksheet.cell(row=current_row, column=col_idx + 4, value=round(symbol_accumulators[symbol]['usd'], 2))
+                cell.alignment = cell_alignment
+                cell.fill = negative_fill
+                
+            else:
+                # No data for this level - fill all 5 columns with N/A
+                for i in range(5):
+                    cell = worksheet.cell(row=current_row, column=col_idx + i, value="N/A")
+                    cell.alignment = cell_alignment
+            
+            col_idx += 5  # Move to next symbol's columns
         
         current_row += 1
     
     # Adjust column widths
     worksheet.column_dimensions['A'].width = 10
+    # For tables 1-3: normal width
     for col_idx in range(2, len(symbols) + 2):
         col_letter = get_column_letter(col_idx)
         worksheet.column_dimensions[col_letter].width = 15
+    # For table 4: wider columns (5 columns per symbol)
+    total_table4_cols = len(symbols) * 5
+    for col_idx in range(2, total_table4_cols + 2):
+        col_letter = get_column_letter(col_idx)
+        worksheet.column_dimensions[col_letter].width = 12
     
     # Save the workbook
     workbook.save(output_filename)
