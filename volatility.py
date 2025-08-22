@@ -10,8 +10,9 @@ Reads CSV files with 5-minute price updates and calculates:
 import pandas as pd
 import numpy as np
 import sys
+import json
 from pathlib import Path
-from typing import Optional, Dict, Tuple
+from typing import Optional, Dict, Tuple, List
 from orderbook_utils import validate_required_columns, REQUIRED_CSV_COLUMNS
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment
@@ -35,6 +36,24 @@ def calculate_log_returns(prices: pd.Series) -> pd.Series:
     log_returns = np.log(prices / prices.shift(1))
     
     return log_returns.dropna()
+
+
+def parse_orderbook_levels(orderbook_str: str) -> List[float]:
+    """
+    Parse orderbook JSON string and extract all price levels.
+    
+    Args:
+        orderbook_str: JSON string containing orderbook data
+        
+    Returns:
+        List of all price levels (floats)
+    """
+    try:
+        orderbook = json.loads(orderbook_str)
+        prices = [float(level["px"]) for level in orderbook]
+        return prices
+    except (json.JSONDecodeError, KeyError, ValueError):
+        return []
 
 
 def calculate_volatility_metrics(log_returns: pd.Series) -> Dict[str, float]:
@@ -142,6 +161,17 @@ def analyze_csv_volatility(csv_path: str, symbol_filters: Optional[list] = None)
         # Calculate volatility metrics
         vol_metrics = calculate_volatility_metrics(log_returns)
         
+        # Parse orderbook data for levels (get latest snapshot)
+        latest_row = symbol_data.iloc[-1]
+        bid_levels = []
+        ask_levels = []
+        
+        if 'bids' in symbol_data.columns and pd.notna(latest_row['bids']):
+            bid_levels = parse_orderbook_levels(latest_row['bids'])
+        
+        if 'asks' in symbol_data.columns and pd.notna(latest_row['asks']):
+            ask_levels = parse_orderbook_levels(latest_row['asks'])
+        
         results[symbol] = {
             'volatility_metrics': vol_metrics,
             'price_stats': {
@@ -150,6 +180,10 @@ def analyze_csv_volatility(csv_path: str, symbol_filters: Optional[list] = None)
                 'mean_price': prices.mean(),
                 'latest_price': prices.iloc[-1],  # Last snapshot price
                 'price_range_pct': ((prices.max() - prices.min()) / prices.mean()) * 100
+            },
+            'orderbook_levels': {
+                'bid_levels': bid_levels,
+                'ask_levels': ask_levels
             },
             'data_quality': {
                 'total_observations': len(prices),
@@ -167,9 +201,9 @@ def create_excel_volatility_tables(results: Dict, output_filename: str = "volati
     1. Volatility Analysis (% values without % symbol)
     2. Buy Target Prices
     3. Sell Target Prices
-    4. All Levels - Price Ratios (% values without % symbol)
+    4. Orderbook Levels Analysis - Bid and Ask tables using actual orderbook prices
     
-    Now includes 8 time periods: 3min, 5min, 10min, 30min, 60min, 90min, 1day, 1year
+    Formula for Table 4: level_price/base_price*100 where level_price comes from actual bids/asks data
     
     Args:
         results: Results from analyze_csv_volatility()
@@ -366,88 +400,102 @@ def create_excel_volatility_tables(results: Dict, output_filename: str = "volati
     
     current_row += 2
     
-    # TABLE 4: All Levels - Buy and Sell Price Ratios
-    worksheet.cell(row=current_row, column=1, value="4. All Levels - Price Ratios (Level/Base)*100")
+    # TABLE 4: Levels Analysis - Bid and Ask Tables
+    worksheet.cell(row=current_row, column=1, value="4. Orderbook Levels Analysis - Percentage Difference from Base Price")
     worksheet.cell(row=current_row, column=1).font = table_title_font
     current_row += 2
     
-    # BUY LEVELS SECTION
-    worksheet.cell(row=current_row, column=1, value="BUY LEVELS (% of base)")
+    # BID LEVELS TABLE
+    worksheet.cell(row=current_row, column=1, value="BID LEVELS (% Below Base Price)")
     worksheet.cell(row=current_row, column=1).font = Font(bold=True, color="008000")  # Green
     current_row += 1
     
-    # Headers for buy levels
-    worksheet.cell(row=current_row, column=1, value="Levels")
+    # Headers for bid levels
+    worksheet.cell(row=current_row, column=1, value="Level")
     worksheet.cell(row=current_row, column=1).font = header_font
     worksheet.cell(row=current_row, column=1).fill = header_fill
     worksheet.cell(row=current_row, column=1).alignment = cell_alignment
     
     for col_idx, symbol in enumerate(symbols, start=2):
-        worksheet.cell(row=current_row, column=col_idx, value=f"{symbol} (% values)")
+        worksheet.cell(row=current_row, column=col_idx, value=f"{symbol}")
         worksheet.cell(row=current_row, column=col_idx).font = header_font
         worksheet.cell(row=current_row, column=col_idx).fill = header_fill
         worksheet.cell(row=current_row, column=col_idx).alignment = cell_alignment
     
     current_row += 1
     
-    # Data rows for buy levels - levels 1-8 corresponding to time periods
-    for level, (minutes, time_label, vol_key) in enumerate(zip(time_periods, time_labels, vol_keys), start=1):
+    # Data rows for bid levels - using actual orderbook bid prices (all levels)
+    max_bid_levels = max([len(results[symbol]['orderbook_levels']['bid_levels']) for symbol in symbols]) if symbols else 0
+    
+    for level in range(1, max_bid_levels + 1):
         worksheet.cell(row=current_row, column=1, value=level)
         worksheet.cell(row=current_row, column=1).alignment = cell_alignment
         worksheet.cell(row=current_row, column=1).font = Font(bold=True)
         
         for col_idx, symbol in enumerate(symbols, start=2):
             base_price = results[symbol]['price_stats']['latest_price']
-            volatility = results[symbol]['volatility_metrics'][vol_key]
-            buy_price = base_price + (volatility * base_price)
+            bid_levels = results[symbol]['orderbook_levels']['bid_levels']
             
-            # Calculate: (level_price / base_price) * 100
-            pct_ratio = (buy_price / base_price) * 100
-            
-            cell = worksheet.cell(row=current_row, column=col_idx, value=round(pct_ratio, 3))
-            cell.alignment = cell_alignment
-            cell.fill = positive_fill  # Light green background
+            if level <= len(bid_levels):
+                level_price = bid_levels[level - 1]  # level 1 = index 0
+                # Calculate percentage difference: (level_price/base_price*100) - 100
+                pct_diff = (level_price / base_price * 100) - 100
+                
+                cell = worksheet.cell(row=current_row, column=col_idx, value=round(pct_diff, 3))
+                cell.alignment = cell_alignment
+                cell.fill = positive_fill  # Light green background
+            else:
+                # No data for this level
+                cell = worksheet.cell(row=current_row, column=col_idx, value="N/A")
+                cell.alignment = cell_alignment
         
         current_row += 1
     
     current_row += 1
     
-    # SELL LEVELS SECTION
-    worksheet.cell(row=current_row, column=1, value="SELL LEVELS (% of base)")
+    # ASK LEVELS TABLE
+    worksheet.cell(row=current_row, column=1, value="ASK LEVELS (% Above Base Price)")
     worksheet.cell(row=current_row, column=1).font = Font(bold=True, color="CC0000")  # Red
     current_row += 1
     
-    # Headers for sell levels
-    worksheet.cell(row=current_row, column=1, value="Levels")
+    # Headers for ask levels
+    worksheet.cell(row=current_row, column=1, value="Level")
     worksheet.cell(row=current_row, column=1).font = header_font
     worksheet.cell(row=current_row, column=1).fill = header_fill
     worksheet.cell(row=current_row, column=1).alignment = cell_alignment
     
     for col_idx, symbol in enumerate(symbols, start=2):
-        worksheet.cell(row=current_row, column=col_idx, value=f"{symbol} (% values)")
+        worksheet.cell(row=current_row, column=col_idx, value=f"{symbol}")
         worksheet.cell(row=current_row, column=col_idx).font = header_font
         worksheet.cell(row=current_row, column=col_idx).fill = header_fill
         worksheet.cell(row=current_row, column=col_idx).alignment = cell_alignment
     
     current_row += 1
     
-    # Data rows for sell levels - levels 1-8 corresponding to time periods
-    for level, (minutes, time_label, vol_key) in enumerate(zip(time_periods, time_labels, vol_keys), start=1):
+    # Data rows for ask levels - using actual orderbook ask prices (all levels)
+    max_ask_levels = max([len(results[symbol]['orderbook_levels']['ask_levels']) for symbol in symbols]) if symbols else 0
+    
+    for level in range(1, max_ask_levels + 1):
         worksheet.cell(row=current_row, column=1, value=level)
         worksheet.cell(row=current_row, column=1).alignment = cell_alignment
         worksheet.cell(row=current_row, column=1).font = Font(bold=True)
         
         for col_idx, symbol in enumerate(symbols, start=2):
             base_price = results[symbol]['price_stats']['latest_price']
-            volatility = results[symbol]['volatility_metrics'][vol_key]
-            sell_price = base_price - (volatility * base_price)
+            ask_levels = results[symbol]['orderbook_levels']['ask_levels']
             
-            # Calculate: (level_price / base_price) * 100
-            pct_ratio = (sell_price / base_price) * 100
-            
-            cell = worksheet.cell(row=current_row, column=col_idx, value=round(pct_ratio, 3))
-            cell.alignment = cell_alignment
-            cell.fill = negative_fill  # Light red background
+            if level <= len(ask_levels):
+                level_price = ask_levels[level - 1]  # level 1 = index 0
+                # Calculate percentage difference: (level_price/base_price*100) - 100
+                pct_diff = (level_price / base_price * 100) - 100
+                
+                cell = worksheet.cell(row=current_row, column=col_idx, value=round(pct_diff, 3))
+                cell.alignment = cell_alignment
+                cell.fill = negative_fill  # Light red background
+            else:
+                # No data for this level
+                cell = worksheet.cell(row=current_row, column=col_idx, value="N/A")
+                cell.alignment = cell_alignment
         
         current_row += 1
     
