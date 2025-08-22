@@ -3,7 +3,7 @@
 Volatility Calculator for 5-minute orderbook data.
 
 Reads CSV files with 5-minute price updates and calculates:
-- Multiple time period volatilities (3, 5, 10, 30, 60, 90 minutes)
+- Multiple time period volatilities (3, 5, 10, 30, 60, 90 minutes, 1 day, 1 year)
 - Exports results to Excel with formatted tables
 """
 
@@ -55,6 +55,8 @@ def calculate_volatility_metrics(log_returns: pd.Series) -> Dict[str, float]:
             '30min_vol': 0.0,
             '60min_vol': 0.0,
             '90min_vol': 0.0,
+            '1day_vol': 0.0,
+            '1year_vol': 0.0,
             'sample_size': len(log_returns)
         }
     
@@ -62,11 +64,13 @@ def calculate_volatility_metrics(log_returns: pd.Series) -> Dict[str, float]:
     vol_5min = log_returns.std()
     
     # Scale to different time periods using sqrt(time_ratio)
-    vol_3min = vol_5min * np.sqrt(3/5)      # 3 minutes
-    vol_10min = vol_5min * np.sqrt(10/5)    # 10 minutes = sqrt(2)
-    vol_30min = vol_5min * np.sqrt(30/5)    # 30 minutes = sqrt(6)
-    vol_60min = vol_5min * np.sqrt(60/5)    # 60 minutes = sqrt(12)
-    vol_90min = vol_5min * np.sqrt(90/5)    # 90 minutes = sqrt(18)
+    vol_3min = vol_5min * np.sqrt(3/5)        # 3 minutes
+    vol_10min = vol_5min * np.sqrt(10/5)      # 10 minutes = sqrt(2)
+    vol_30min = vol_5min * np.sqrt(30/5)      # 30 minutes = sqrt(6)
+    vol_60min = vol_5min * np.sqrt(60/5)      # 60 minutes = sqrt(12)
+    vol_90min = vol_5min * np.sqrt(90/5)      # 90 minutes = sqrt(18)
+    vol_1day = vol_5min * np.sqrt(1440/5)     # 1 day = 1440 minutes = sqrt(288)
+    vol_1year = vol_5min * np.sqrt(525600/5)  # 1 year = 525600 minutes = sqrt(105120)
     
     return {
         '3min_vol': vol_3min,
@@ -75,6 +79,8 @@ def calculate_volatility_metrics(log_returns: pd.Series) -> Dict[str, float]:
         '30min_vol': vol_30min,
         '60min_vol': vol_60min,
         '90min_vol': vol_90min,
+        '1day_vol': vol_1day,
+        '1year_vol': vol_1year,
         'sample_size': len(log_returns),
         'mean_return': log_returns.mean()
     }
@@ -113,7 +119,8 @@ def analyze_csv_volatility(csv_path: str, symbol_filters: Optional[list] = None)
     
     # Convert timestamp to datetime if it's not already
     if 'ts' in df.columns:
-        df['ts'] = pd.to_datetime(df['ts'])
+        # Handle mixed timestamp formats (some with microseconds, some without)
+        df['ts'] = pd.to_datetime(df['ts'], format='mixed')
         df = df.sort_values('ts')
     
     results = {} 
@@ -154,37 +161,15 @@ def analyze_csv_volatility(csv_path: str, symbol_filters: Optional[list] = None)
     return results
 
 
-def print_volatility_report(results: Dict) -> None:
-    """
-    Print a formatted volatility report.
-    
-    Args:
-        results: Results from analyze_csv_volatility()
-    """
-    print("\n" + "="*60)
-    print("VOLATILITY ANALYSIS REPORT")
-    print("="*60)
-    
-    for symbol, data in results.items():
-        vol = data['volatility_metrics']
-        
-        print(f"\n📊 SYMBOL: {symbol}")
-        
-        print(f"\n📈 VOLATILITY METRICS:")
-        print(f"   3-minute vol:  ±{vol['3min_vol']*100:.3f}% (68% confidence), ±{vol['3min_vol']*100*1.96:.3f}% (95% confidence)")
-        print(f"   5-minute vol:  ±{vol['5min_vol']*100:.3f}% (68% confidence), ±{vol['5min_vol']*100*1.96:.3f}% (95% confidence)")
-        print(f"   10-minute vol: ±{vol['10min_vol']*100:.3f}% (68% confidence), ±{vol['10min_vol']*100*1.96:.3f}% (95% confidence)")
-        print(f"   30-minute vol: ±{vol['30min_vol']*100:.2f}% (68% confidence), ±{vol['30min_vol']*100*1.96:.2f}% (95% confidence)")
-        print(f"   60-minute vol: ±{vol['60min_vol']*100:.2f}% (68% confidence), ±{vol['60min_vol']*100*1.96:.2f}% (95% confidence)")
-        print(f"   90-minute vol: ±{vol['90min_vol']*100:.2f}% (68% confidence), ±{vol['90min_vol']*100*1.96:.2f}% (95% confidence)")
-
-
 def create_excel_volatility_tables(results: Dict, output_filename: str = "volatility_analysis.xlsx") -> None:
     """
-    Create Excel file with three consolidated tables:
-    1. Volatility Analysis (Delta Percentages)
+    Create Excel file with four consolidated tables:
+    1. Volatility Analysis (% values without % symbol)
     2. Buy Target Prices
     3. Sell Target Prices
+    4. All Levels - Price Ratios (% values without % symbol)
+    
+    Now includes 8 time periods: 3min, 5min, 10min, 30min, 60min, 90min, 1day, 1year
     
     Args:
         results: Results from analyze_csv_volatility()
@@ -200,13 +185,21 @@ def create_excel_volatility_tables(results: Dict, output_filename: str = "volati
     header_fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
     table_title_font = Font(bold=True, size=14, color="000000")
     cell_alignment = Alignment(horizontal="center", vertical="center")
+    positive_fill = PatternFill(start_color="E8F5E8", end_color="E8F5E8", fill_type="solid")  # Light green
+    negative_fill = PatternFill(start_color="FFF2F2", end_color="FFF2F2", fill_type="solid")  # Light red
     
     # Get symbols and time periods
     symbols = list(results.keys())
-    time_periods = [3, 5, 10, 30, 60, 90]
-    vol_keys = ['3min_vol', '5min_vol', '10min_vol', '30min_vol', '60min_vol', '90min_vol']
+    time_periods = [3, 5, 10, 30, 60, 90, 1440, 525600]  # Added 1 day (1440 min) and 1 year (525600 min)
+    time_labels = ["3min", "5min", "10min", "30min", "60min", "90min", "1day", "1year"]
+    vol_keys = ['3min_vol', '5min_vol', '10min_vol', '30min_vol', '60min_vol', '90min_vol', '1day_vol', '1year_vol']
     
     current_row = 1
+    
+    # Add note about percentages at the top
+    worksheet.cell(row=current_row, column=1, value="NOTE: All percentage values in tables below are numbers without % symbol for easier Excel editing")
+    worksheet.cell(row=current_row, column=1).font = Font(italic=True, size=10, color="666666")
+    current_row += 2
     
     # TABLE 1: Volatility Analysis (Delta Percentages)
     worksheet.cell(row=current_row, column=1, value="1. Volatility Analysis - Delta Percentages")
@@ -220,7 +213,7 @@ def create_excel_volatility_tables(results: Dict, output_filename: str = "volati
     worksheet.cell(row=current_row, column=1).alignment = cell_alignment
     
     for col_idx, symbol in enumerate(symbols, start=2):
-        worksheet.cell(row=current_row, column=col_idx, value=f"{symbol} (%)")
+        worksheet.cell(row=current_row, column=col_idx, value=f"{symbol} (% values)")
         worksheet.cell(row=current_row, column=col_idx).font = header_font
         worksheet.cell(row=current_row, column=col_idx).fill = header_fill
         worksheet.cell(row=current_row, column=col_idx).alignment = cell_alignment
@@ -228,14 +221,21 @@ def create_excel_volatility_tables(results: Dict, output_filename: str = "volati
     current_row += 1
     
     # Data rows for volatility
-    for row_idx, (minutes, vol_key) in enumerate(zip(time_periods, vol_keys)):
-        worksheet.cell(row=current_row, column=1, value=minutes)
+    for row_idx, (minutes, time_label, vol_key) in enumerate(zip(time_periods, time_labels, vol_keys)):
+        if time_label == "1day":
+            display_label = "1 day"
+        elif time_label == "1year":
+            display_label = "1 year"
+        else:
+            display_label = str(minutes)
+            
+        worksheet.cell(row=current_row, column=1, value=display_label)
         worksheet.cell(row=current_row, column=1).alignment = cell_alignment
         worksheet.cell(row=current_row, column=1).font = Font(bold=True)
         
         for col_idx, symbol in enumerate(symbols, start=2):
             volatility = results[symbol]['volatility_metrics'][vol_key]
-            worksheet.cell(row=current_row, column=col_idx, value=f"{volatility*100:.3f}%")
+            worksheet.cell(row=current_row, column=col_idx, value=round(volatility*100, 3))
             worksheet.cell(row=current_row, column=col_idx).alignment = cell_alignment
         
         current_row += 1
@@ -272,8 +272,15 @@ def create_excel_volatility_tables(results: Dict, output_filename: str = "volati
     current_row += 1
     
     # Data rows for buy prices
-    for row_idx, (minutes, vol_key) in enumerate(zip(time_periods, vol_keys)):
-        worksheet.cell(row=current_row, column=1, value=minutes)
+    for row_idx, (minutes, time_label, vol_key) in enumerate(zip(time_periods, time_labels, vol_keys)):
+        if time_label == "1day":
+            display_label = "1 day"
+        elif time_label == "1year":
+            display_label = "1 year"
+        else:
+            display_label = str(minutes)
+            
+        worksheet.cell(row=current_row, column=1, value=display_label)
         worksheet.cell(row=current_row, column=1).alignment = cell_alignment
         worksheet.cell(row=current_row, column=1).font = Font(bold=True)
         
@@ -327,8 +334,15 @@ def create_excel_volatility_tables(results: Dict, output_filename: str = "volati
     current_row += 1
     
     # Data rows for sell prices
-    for row_idx, (minutes, vol_key) in enumerate(zip(time_periods, vol_keys)):
-        worksheet.cell(row=current_row, column=1, value=minutes)
+    for row_idx, (minutes, time_label, vol_key) in enumerate(zip(time_periods, time_labels, vol_keys)):
+        if time_label == "1day":
+            display_label = "1 day"
+        elif time_label == "1year":
+            display_label = "1 year"
+        else:
+            display_label = str(minutes)
+            
+        worksheet.cell(row=current_row, column=1, value=display_label)
         worksheet.cell(row=current_row, column=1).alignment = cell_alignment
         worksheet.cell(row=current_row, column=1).font = Font(bold=True)
         
@@ -350,18 +364,101 @@ def create_excel_volatility_tables(results: Dict, output_filename: str = "volati
         
         current_row += 1
     
+    current_row += 2
+    
+    # TABLE 4: All Levels - Buy and Sell Price Ratios
+    worksheet.cell(row=current_row, column=1, value="4. All Levels - Price Ratios (Level/Base)*100")
+    worksheet.cell(row=current_row, column=1).font = table_title_font
+    current_row += 2
+    
+    # BUY LEVELS SECTION
+    worksheet.cell(row=current_row, column=1, value="BUY LEVELS (% of base)")
+    worksheet.cell(row=current_row, column=1).font = Font(bold=True, color="008000")  # Green
+    current_row += 1
+    
+    # Headers for buy levels
+    worksheet.cell(row=current_row, column=1, value="Levels")
+    worksheet.cell(row=current_row, column=1).font = header_font
+    worksheet.cell(row=current_row, column=1).fill = header_fill
+    worksheet.cell(row=current_row, column=1).alignment = cell_alignment
+    
+    for col_idx, symbol in enumerate(symbols, start=2):
+        worksheet.cell(row=current_row, column=col_idx, value=f"{symbol} (% values)")
+        worksheet.cell(row=current_row, column=col_idx).font = header_font
+        worksheet.cell(row=current_row, column=col_idx).fill = header_fill
+        worksheet.cell(row=current_row, column=col_idx).alignment = cell_alignment
+    
+    current_row += 1
+    
+    # Data rows for buy levels - levels 1-8 corresponding to time periods
+    for level, (minutes, time_label, vol_key) in enumerate(zip(time_periods, time_labels, vol_keys), start=1):
+        worksheet.cell(row=current_row, column=1, value=level)
+        worksheet.cell(row=current_row, column=1).alignment = cell_alignment
+        worksheet.cell(row=current_row, column=1).font = Font(bold=True)
+        
+        for col_idx, symbol in enumerate(symbols, start=2):
+            base_price = results[symbol]['price_stats']['latest_price']
+            volatility = results[symbol]['volatility_metrics'][vol_key]
+            buy_price = base_price + (volatility * base_price)
+            
+            # Calculate: (level_price / base_price) * 100
+            pct_ratio = (buy_price / base_price) * 100
+            
+            cell = worksheet.cell(row=current_row, column=col_idx, value=round(pct_ratio, 3))
+            cell.alignment = cell_alignment
+            cell.fill = positive_fill  # Light green background
+        
+        current_row += 1
+    
+    current_row += 1
+    
+    # SELL LEVELS SECTION
+    worksheet.cell(row=current_row, column=1, value="SELL LEVELS (% of base)")
+    worksheet.cell(row=current_row, column=1).font = Font(bold=True, color="CC0000")  # Red
+    current_row += 1
+    
+    # Headers for sell levels
+    worksheet.cell(row=current_row, column=1, value="Levels")
+    worksheet.cell(row=current_row, column=1).font = header_font
+    worksheet.cell(row=current_row, column=1).fill = header_fill
+    worksheet.cell(row=current_row, column=1).alignment = cell_alignment
+    
+    for col_idx, symbol in enumerate(symbols, start=2):
+        worksheet.cell(row=current_row, column=col_idx, value=f"{symbol} (% values)")
+        worksheet.cell(row=current_row, column=col_idx).font = header_font
+        worksheet.cell(row=current_row, column=col_idx).fill = header_fill
+        worksheet.cell(row=current_row, column=col_idx).alignment = cell_alignment
+    
+    current_row += 1
+    
+    # Data rows for sell levels - levels 1-8 corresponding to time periods
+    for level, (minutes, time_label, vol_key) in enumerate(zip(time_periods, time_labels, vol_keys), start=1):
+        worksheet.cell(row=current_row, column=1, value=level)
+        worksheet.cell(row=current_row, column=1).alignment = cell_alignment
+        worksheet.cell(row=current_row, column=1).font = Font(bold=True)
+        
+        for col_idx, symbol in enumerate(symbols, start=2):
+            base_price = results[symbol]['price_stats']['latest_price']
+            volatility = results[symbol]['volatility_metrics'][vol_key]
+            sell_price = base_price - (volatility * base_price)
+            
+            # Calculate: (level_price / base_price) * 100
+            pct_ratio = (sell_price / base_price) * 100
+            
+            cell = worksheet.cell(row=current_row, column=col_idx, value=round(pct_ratio, 3))
+            cell.alignment = cell_alignment
+            cell.fill = negative_fill  # Light red background
+        
+        current_row += 1
+    
     # Adjust column widths
     worksheet.column_dimensions['A'].width = 10
     for col_idx in range(2, len(symbols) + 2):
         col_letter = get_column_letter(col_idx)
-        worksheet.column_dimensions[col_letter].width = 18  # Increased for base price in header
+        worksheet.column_dimensions[col_letter].width = 15
     
     # Save the workbook
     workbook.save(output_filename)
-    print(f"\n📊 Excel file saved: {output_filename}")
-    print(f"    - Table 1: Volatility Analysis (Delta %)")
-    print(f"    - Table 2: Buy Target Prices")
-    print(f"    - Table 3: Sell Target Prices")
 
 
 def main():
@@ -382,9 +479,6 @@ def main():
     
     # Analyze volatility
     results = analyze_csv_volatility(csv_path, symbol_filters)
-    
-    # Print report
-    print_volatility_report(results)
     
     # Create Excel file with volatility tables
     create_excel_volatility_tables(results)
