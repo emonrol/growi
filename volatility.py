@@ -15,6 +15,7 @@ from typing import Optional, Dict, Tuple
 from orderbook_utils import validate_required_columns, REQUIRED_CSV_COLUMNS
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.utils import get_column_letter
 
 
 def calculate_log_returns(prices: pd.Series) -> pd.Series:
@@ -179,7 +180,7 @@ def print_volatility_report(results: Dict) -> None:
 
 def create_excel_volatility_tables(results: Dict, output_filename: str = "volatility_analysis.xlsx") -> None:
     """
-    Create Excel file with volatility tables for each symbol.
+    Create Excel file with consolidated volatility table.
     
     Args:
         results: Results from analyze_csv_volatility()
@@ -191,52 +192,50 @@ def create_excel_volatility_tables(results: Dict, output_filename: str = "volati
     worksheet.title = "Volatility Analysis"
     
     # Define styles
-    header_font = Font(bold=True, size=12)
+    header_font = Font(bold=True, size=12, color="FFFFFF")
     header_fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
     cell_alignment = Alignment(horizontal="center", vertical="center")
     
-    current_row = 1
+    # Title
+    worksheet.cell(row=1, column=1, value="Volatility Analysis - Multiple Time Periods")
+    worksheet.cell(row=1, column=1).font = Font(bold=True, size=14)
     
-    for symbol, data in results.items():
-        vol = data['volatility_metrics']
+    # Headers - first column is Minutes, then each symbol
+    worksheet.cell(row=3, column=1, value="Minutes")
+    worksheet.cell(row=3, column=1).font = header_font
+    worksheet.cell(row=3, column=1).fill = header_fill
+    worksheet.cell(row=3, column=1).alignment = cell_alignment
+    
+    # Add symbol headers
+    symbols = list(results.keys())
+    for col_idx, symbol in enumerate(symbols, start=2):
+        worksheet.cell(row=3, column=col_idx, value=f"{symbol} (%)")
+        worksheet.cell(row=3, column=col_idx).font = header_font
+        worksheet.cell(row=3, column=col_idx).fill = header_fill
+        worksheet.cell(row=3, column=col_idx).alignment = cell_alignment
+    
+    # Time periods
+    time_periods = [3, 5, 10, 30, 60, 90]
+    vol_keys = ['3min_vol', '5min_vol', '10min_vol', '30min_vol', '60min_vol', '90min_vol']
+    
+    # Fill data rows
+    for row_idx, (minutes, vol_key) in enumerate(zip(time_periods, vol_keys), start=4):
+        # Minutes column
+        worksheet.cell(row=row_idx, column=1, value=minutes)
+        worksheet.cell(row=row_idx, column=1).alignment = cell_alignment
+        worksheet.cell(row=row_idx, column=1).font = Font(bold=True)
         
-        # Symbol header
-        worksheet.cell(row=current_row, column=1, value=f"{symbol} Volatility")
-        worksheet.cell(row=current_row, column=1).font = Font(bold=True, size=14)
-        current_row += 2
-        
-        # Table headers
-        worksheet.cell(row=current_row, column=1, value="Minutes")
-        worksheet.cell(row=current_row, column=2, value="Volatility (%)")
-        worksheet.cell(row=current_row, column=1).font = header_font
-        worksheet.cell(row=current_row, column=2).font = header_font
-        worksheet.cell(row=current_row, column=1).fill = header_fill
-        worksheet.cell(row=current_row, column=2).fill = header_fill
-        current_row += 1
-        
-        # Data rows
-        time_periods = [
-            (3, vol['3min_vol']),
-            (5, vol['5min_vol']),
-            (10, vol['10min_vol']),
-            (30, vol['30min_vol']),
-            (60, vol['60min_vol']),
-            (90, vol['90min_vol'])
-        ]
-        
-        for minutes, volatility in time_periods:
-            worksheet.cell(row=current_row, column=1, value=minutes)
-            worksheet.cell(row=current_row, column=2, value=f"{volatility*100:.3f}%")
-            worksheet.cell(row=current_row, column=1).alignment = cell_alignment
-            worksheet.cell(row=current_row, column=2).alignment = cell_alignment
-            current_row += 1
-        
-        # Add space between symbols
-        current_row += 2
+        # Volatility columns for each symbol
+        for col_idx, symbol in enumerate(symbols, start=2):
+            volatility = results[symbol]['volatility_metrics'][vol_key]
+            worksheet.cell(row=row_idx, column=col_idx, value=f"{volatility*100:.3f}%")
+            worksheet.cell(row=row_idx, column=col_idx).alignment = cell_alignment
     
     # Adjust column widths
-    worksheet.column_dimensions['A'].width = 12
-    worksheet.column_dimensions['B'].width = 15
+    worksheet.column_dimensions['A'].width = 10
+    for col_idx in range(2, len(symbols) + 2):
+        col_letter = get_column_letter(col_idx)
+        worksheet.column_dimensions[col_letter].width = 12
     
     # Save the workbook
     workbook.save(output_filename)
