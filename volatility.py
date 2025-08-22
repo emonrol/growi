@@ -3,9 +3,8 @@
 Volatility Calculator for 5-minute orderbook data.
 
 Reads CSV files with 5-minute price updates and calculates:
-- 5-minute volatility (from log returns)
-- Daily volatility (scaled)
-- Annual volatility (scaled)
+- Multiple time period volatilities (3, 5, 10, 30, 60, 90 minutes)
+- Exports results to Excel with formatted tables
 """
 
 import pandas as pd
@@ -14,6 +13,8 @@ import sys
 from pathlib import Path
 from typing import Optional, Dict, Tuple
 from orderbook_utils import validate_required_columns, REQUIRED_CSV_COLUMNS
+import openpyxl
+from openpyxl.styles import Font, PatternFill, Alignment
 
 
 def calculate_log_returns(prices: pd.Series) -> pd.Series:
@@ -37,100 +38,58 @@ def calculate_log_returns(prices: pd.Series) -> pd.Series:
 
 def calculate_volatility_metrics(log_returns: pd.Series) -> Dict[str, float]:
     """
-    Calculate various volatility metrics from log returns.
+    Calculate volatility metrics for multiple time periods from log returns.
     
     Args:
-        log_returns: Series of logarithmic returns
+        log_returns: Series of logarithmic returns (from 5-minute data)
         
     Returns:
-        Dictionary with volatility metrics
+        Dictionary with volatility metrics for different time periods
     """
     if len(log_returns) < 2:
         return {
+            '3min_vol': 0.0,
             '5min_vol': 0.0,
-            'daily_vol': 0.0,
-            'annual_vol': 0.0,
+            '10min_vol': 0.0,
+            '30min_vol': 0.0,
+            '60min_vol': 0.0,
+            '90min_vol': 0.0,
             'sample_size': len(log_returns)
         }
     
-    # 5-minute volatility (standard deviation of log returns)
+    # 5-minute volatility (standard deviation of log returns) - this is our base
     vol_5min = log_returns.std()
     
-    # Scale to daily volatility
-    # There are 288 five-minute periods in a day (24*60/5 = 288)
-    vol_daily = vol_5min * np.sqrt(288)
-    
-    # Scale to annual volatility 
-    # Method 1: From 5-min to annual directly
-    # vol_annual = vol_5min * np.sqrt(288 * 365)
-    
-    # Method 2: From daily to annual (more common)
-    vol_annual = vol_daily * np.sqrt(365)
+    # Scale to different time periods using sqrt(time_ratio)
+    vol_3min = vol_5min * np.sqrt(3/5)      # 3 minutes
+    vol_10min = vol_5min * np.sqrt(10/5)    # 10 minutes = sqrt(2)
+    vol_30min = vol_5min * np.sqrt(30/5)    # 30 minutes = sqrt(6)
+    vol_60min = vol_5min * np.sqrt(60/5)    # 60 minutes = sqrt(12)
+    vol_90min = vol_5min * np.sqrt(90/5)    # 90 minutes = sqrt(18)
     
     return {
+        '3min_vol': vol_3min,
         '5min_vol': vol_5min,
-        'daily_vol': vol_daily, 
-        'annual_vol': vol_annual,
+        '10min_vol': vol_10min,
+        '30min_vol': vol_30min,
+        '60min_vol': vol_60min,
+        '90min_vol': vol_90min,
         'sample_size': len(log_returns),
-        'mean_return': log_returns.mean(),
-        'skewness': log_returns.skew(),
-        'kurtosis': log_returns.kurtosis()
+        'mean_return': log_returns.mean()
     }
 
 
-def calculate_rolling_volatility(prices: pd.Series, window_hours: int = 24) -> pd.DataFrame:
-    """
-    Calculate rolling volatility over time.
-    
-    Args:
-        prices: Series of prices with datetime index
-        window_hours: Rolling window size in hours (default 24 = 1 day)
-        
-    Returns:
-        DataFrame with rolling volatility metrics
-    """
-    # Calculate window size in 5-minute periods
-    window_periods = window_hours * 12  # 12 five-minute periods per hour
-    
-    # Calculate log returns (this will have one less element than prices)
-    log_returns = calculate_log_returns(prices)
-    
-    # Rolling standard deviation (5-min volatility)
-    rolling_vol_5min = log_returns.rolling(window=window_periods).std()
-    
-    # Scale to daily
-    rolling_vol_daily = rolling_vol_5min * np.sqrt(288)
-    
-    # Create aligned series by reindexing to match the original prices index
-    # This automatically handles the length differences
-    log_returns_aligned = log_returns.reindex(prices.index)
-    rolling_vol_5min_aligned = rolling_vol_5min.reindex(prices.index)
-    rolling_vol_daily_aligned = rolling_vol_daily.reindex(prices.index)
-    
-    # Create result DataFrame - now all series have the same length
-    result = pd.DataFrame({
-        'price': prices,
-        'log_return': log_returns_aligned,
-        'vol_5min_rolling': rolling_vol_5min_aligned,
-        'vol_daily_rolling': rolling_vol_daily_aligned
-    })
-    
-    return result
-
-
-def analyze_csv_volatility(csv_path: str, symbol_filter: Optional[str] = None) -> Dict:
+def analyze_csv_volatility(csv_path: str, symbol_filters: Optional[list] = None) -> Dict:
     """
     Main function to analyze volatility from CSV file.
     
     Args:
         csv_path: Path to CSV file
-        symbol_filter: Optional symbol to filter (e.g., 'BTCUSDT')
+        symbol_filters: Optional list of symbols to filter (e.g., ['BTCUSDT', 'ETHUSDT'])
         
     Returns:
         Dictionary with analysis results
     """
-    print(f"Reading CSV: {csv_path}")
-    
     try:
         df = pd.read_csv(csv_path)
     except Exception as e:
@@ -139,16 +98,17 @@ def analyze_csv_volatility(csv_path: str, symbol_filter: Optional[str] = None) -
     # Validate required columns
     validate_required_columns(df.columns.tolist(), REQUIRED_CSV_COLUMNS)
     
-    print(f"Loaded {len(df)} rows")
-    print(f"Columns: {list(df.columns)}")
-    print(f"Symbols in data: {df['symbol'].unique()}")
-    
-    # Filter by symbol if specified
-    if symbol_filter:
-        df = df[df['symbol'] == symbol_filter]
+    # Filter by symbols if specified
+    if symbol_filters:
+        df = df[df['symbol'].isin(symbol_filters)]
         if len(df) == 0:
-            raise SystemExit(f"No data found for symbol: {symbol_filter}")
-        print(f"Filtered to {len(df)} rows for symbol: {symbol_filter}")
+            raise SystemExit(f"No data found for symbols: {symbol_filters}")
+        
+        # Check which symbols were actually found
+        found_symbols = df['symbol'].unique()
+        missing_symbols = set(symbol_filters) - set(found_symbols)
+        if missing_symbols:
+            print(f"Warning: Symbols not found in data: {missing_symbols}")
     
     # Convert timestamp to datetime if it's not already
     if 'ts' in df.columns:
@@ -174,12 +134,8 @@ def analyze_csv_volatility(csv_path: str, symbol_filter: Optional[str] = None) -
         # Calculate volatility metrics
         vol_metrics = calculate_volatility_metrics(log_returns)
         
-        # Calculate rolling volatility (24-hour window)
-        rolling_data = calculate_rolling_volatility(prices, window_hours=24)
-        
         results[symbol] = {
             'volatility_metrics': vol_metrics,
-            'rolling_data': rolling_data,
             'price_stats': {
                 'min_price': prices.min(),
                 'max_price': prices.max(),
@@ -209,70 +165,108 @@ def print_volatility_report(results: Dict) -> None:
     
     for symbol, data in results.items():
         vol = data['volatility_metrics']
-        price_stats = data['price_stats']
-        quality = data['data_quality']
         
         print(f"\n📊 SYMBOL: {symbol}")
-        print(f"   Sample size: {vol['sample_size']:,} observations")
-        print(f"   Time span: {quality['time_span_hours']:.1f} hours" if quality['time_span_hours'] else "")
-        
-        print(f"\n💰 PRICE STATISTICS:")
-        print(f"   Range: ${price_stats['min_price']:,.2f} - ${price_stats['max_price']:,.2f}")
-        print(f"   Average: ${price_stats['mean_price']:,.2f}")
-        print(f"   Total range: {price_stats['price_range_pct']:.1f}%")
         
         print(f"\n📈 VOLATILITY METRICS:")
-        print(f"   5-minute vol:  {vol['5min_vol']*100:.3f}%")
-        print(f"   Daily vol:     {vol['daily_vol']*100:.2f}%")
-        print(f"   Annual vol:    {vol['annual_vol']*100:.1f}%")
+        print(f"   3-minute vol:  ±{vol['3min_vol']*100:.3f}% (68% confidence), ±{vol['3min_vol']*100*1.96:.3f}% (95% confidence)")
+        print(f"   5-minute vol:  ±{vol['5min_vol']*100:.3f}% (68% confidence), ±{vol['5min_vol']*100*1.96:.3f}% (95% confidence)")
+        print(f"   10-minute vol: ±{vol['10min_vol']*100:.3f}% (68% confidence), ±{vol['10min_vol']*100*1.96:.3f}% (95% confidence)")
+        print(f"   30-minute vol: ±{vol['30min_vol']*100:.2f}% (68% confidence), ±{vol['30min_vol']*100*1.96:.2f}% (95% confidence)")
+        print(f"   60-minute vol: ±{vol['60min_vol']*100:.2f}% (68% confidence), ±{vol['60min_vol']*100*1.96:.2f}% (95% confidence)")
+        print(f"   90-minute vol: ±{vol['90min_vol']*100:.2f}% (68% confidence), ±{vol['90min_vol']*100*1.96:.2f}% (95% confidence)")
+
+
+def create_excel_volatility_tables(results: Dict, output_filename: str = "volatility_analysis.xlsx") -> None:
+    """
+    Create Excel file with volatility tables for each symbol.
+    
+    Args:
+        results: Results from analyze_csv_volatility()
+        output_filename: Name of the Excel file to create
+    """
+    # Create workbook and worksheet
+    workbook = openpyxl.Workbook()
+    worksheet = workbook.active
+    worksheet.title = "Volatility Analysis"
+    
+    # Define styles
+    header_font = Font(bold=True, size=12)
+    header_fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
+    cell_alignment = Alignment(horizontal="center", vertical="center")
+    
+    current_row = 1
+    
+    for symbol, data in results.items():
+        vol = data['volatility_metrics']
         
-        print(f"\n📊 RETURN STATISTICS:")
-        print(f"   Mean return:   {vol['mean_return']*100:.4f}% (per 5min)")
-        print(f"   Skewness:      {vol['skewness']:.3f}")
-        print(f"   Kurtosis:      {vol['kurtosis']:.3f}")
+        # Symbol header
+        worksheet.cell(row=current_row, column=1, value=f"{symbol} Volatility")
+        worksheet.cell(row=current_row, column=1).font = Font(bold=True, size=14)
+        current_row += 2
         
-        # Volatility interpretation
-        daily_vol_pct = vol['daily_vol'] * 100
-        if daily_vol_pct < 2:
-            vol_level = "LOW"
-        elif daily_vol_pct < 5:
-            vol_level = "MODERATE" 
-        elif daily_vol_pct < 10:
-            vol_level = "HIGH"
-        else:
-            vol_level = "EXTREME"
-            
-        print(f"\n🎯 INTERPRETATION:")
-        print(f"   Volatility level: {vol_level}")
-        print(f"   Expected daily move: ±{daily_vol_pct:.2f}% (68% confidence)")
-        print(f"   Expected daily move: ±{daily_vol_pct*1.96:.2f}% (95% confidence)")
+        # Table headers
+        worksheet.cell(row=current_row, column=1, value="Minutes")
+        worksheet.cell(row=current_row, column=2, value="Volatility (%)")
+        worksheet.cell(row=current_row, column=1).font = header_font
+        worksheet.cell(row=current_row, column=2).font = header_font
+        worksheet.cell(row=current_row, column=1).fill = header_fill
+        worksheet.cell(row=current_row, column=2).fill = header_fill
+        current_row += 1
+        
+        # Data rows
+        time_periods = [
+            (3, vol['3min_vol']),
+            (5, vol['5min_vol']),
+            (10, vol['10min_vol']),
+            (30, vol['30min_vol']),
+            (60, vol['60min_vol']),
+            (90, vol['90min_vol'])
+        ]
+        
+        for minutes, volatility in time_periods:
+            worksheet.cell(row=current_row, column=1, value=minutes)
+            worksheet.cell(row=current_row, column=2, value=f"{volatility*100:.3f}%")
+            worksheet.cell(row=current_row, column=1).alignment = cell_alignment
+            worksheet.cell(row=current_row, column=2).alignment = cell_alignment
+            current_row += 1
+        
+        # Add space between symbols
+        current_row += 2
+    
+    # Adjust column widths
+    worksheet.column_dimensions['A'].width = 12
+    worksheet.column_dimensions['B'].width = 15
+    
+    # Save the workbook
+    workbook.save(output_filename)
+    print(f"\n📊 Excel file saved: {output_filename}")
 
 
 def main():
     """Main execution function."""
     if len(sys.argv) < 2:
-        print("Usage: python volatility_calculator.py <csv_file> [symbol]")
-        print("Example: python volatility_calculator.py orderbook_data.csv BTCUSDT")
+        print("Usage: python volatility_calculator.py <csv_file> [symbol1] [symbol2] [symbol3] ...")
+        print("Examples:")
+        print("  python volatility_calculator.py orderbook_data.csv                    # Analyze all symbols")
+        print("  python volatility_calculator.py orderbook_data.csv BTC               # Analyze one symbol")
+        print("  python volatility_calculator.py orderbook_data.csv BTC ETH SOL       # Analyze multiple symbols")
         sys.exit(1)
     
     csv_path = sys.argv[1]
-    symbol_filter = sys.argv[2] if len(sys.argv) > 2 else None
+    symbol_filters = sys.argv[2:] if len(sys.argv) > 2 else None  # Get all symbols after csv_path
     
     if not Path(csv_path).exists():
         raise SystemExit(f"CSV file not found: {csv_path}")
     
     # Analyze volatility
-    results = analyze_csv_volatility(csv_path, symbol_filter)
+    results = analyze_csv_volatility(csv_path, symbol_filters)
     
     # Print report
     print_volatility_report(results)
     
-    # Optional: Save detailed results to files
-    for symbol, data in results.items():
-        # Save rolling volatility data
-        output_file = f"volatility_analysis_{symbol}.csv"
-        data['rolling_data'].to_csv(output_file, index=True)
-        print(f"\n💾 Detailed data saved to: {output_file}")
+    # Create Excel file with volatility tables
+    create_excel_volatility_tables(results)
 
 
 if __name__ == "__main__":
