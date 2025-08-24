@@ -26,35 +26,44 @@ What this script does
        usd_pXX      : percentile of level USD value (price * qty)
      Accumulated columns are cumulative sums of the percentile values by level.
 
-5) Writes TWO outputs:
+5) Writes outputs:
    - Excel file (volatility_analysis.xlsx) with:
        Table 1: Volatility (% numbers, no % symbol)
        Table 2: Buy target prices (base + vol)
        Table 3: Sell target prices (base - vol)
        Table 4: Leverage information per symbol
-       Table 5: BID & ASK level tables using **percentile values across all snapshots**
-   - Big CSV (orderbook_levels_p01.csv) with the percentile-by-level rows for all symbols/sides.
+       Table 5+: BID & ASK level tables for each requested percentile
+   - CSV files for each percentile (orderbook_levels_pXX.csv)
 
 Usage
 -----
-python volatility.py your_data.csv               # all symbols
-python volatility.py your_data.csv BTC ETH SOL   # subset of symbols
+python volatility.py data.csv                              # Default percentiles [1, 10, 25, 50]
+python volatility.py data.csv BTC ETH                      # Subset of symbols, default percentiles
+python volatility.py data.csv --percentiles 5 25 75       # Custom percentiles (5%, 25%, 75%)
+python volatility.py data.csv BTC --percentiles 10 50     # Symbols + custom percentiles
+
+Arguments
+---------
+--percentiles: Space-separated list of percentiles (1-99). Default: 1 10 25 50
+               Example: --percentiles 5 25 50 75 90
 
 Notes
 -----
-- Default percentile is p01 (=1%) which means: in 99% of snapshots the level has at least
-  these quantities/values. You can change PERC_Q if you want a different percentile.
+- Percentile pXX means: in (100-XX)% of snapshots the level has at least these quantities/values
+- p01 = 1st percentile: 99% of snapshots have at least this much
+- p50 = 50th percentile (median): 50% of snapshots have at least this much
 """
 
 import json
 import sys
+import argparse
 from pathlib import Path
 from typing import Optional, Dict, Tuple, List
 
 import numpy as np
 import pandas as pd
 
-# Optional Excel formatting (kept similar to your original script)
+# Optional Excel formatting
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
@@ -76,12 +85,11 @@ from API import effective_max_leverage_for_notional, HLMetaError
 # Config
 # ----------------------------------------------------------------------------
 
-# Percentile to use (0.01 => p01). Change to 0.05 for p05, etc.
-PERC_Q = 0.5
+# Default percentiles to calculate
+DEFAULT_PERCENTILES = [1, 10, 25, 50]
 
 # Output filenames
 EXCEL_FILENAME = "volatility_analysis.xlsx"
-CSV_PCT_FILENAME = "orderbook_levels_p01.csv"
 
 # ----------------------------------------------------------------------------
 # Math helpers
@@ -237,7 +245,7 @@ def analyze_csv(csv_path: str, symbol_filters: Optional[list] = None) -> Dict:
     return results
 
 # ----------------------------------------------------------------------------
-# Percentile-by-level builder
+# Percentile-by-level builder (modified to handle multiple percentiles)
 # ----------------------------------------------------------------------------
 
 def _collect_levels_for_symbol(symbol_df: pd.DataFrame, side: str) -> Dict[int, Dict[str, list]]:
@@ -273,57 +281,79 @@ def _percentile(series: List[float], q: float) -> float:
         return float('nan')
     return float(pd.Series(series).quantile(q))
 
-def build_percentile_depth(results: Dict, q: float = PERC_Q) -> pd.DataFrame:
+def build_percentile_depth(results: Dict, percentiles: List[int]) -> Dict[int, pd.DataFrame]:
     """
-    For each symbol and side, compute pXX depth table per level, across all snapshots.
-    Returns a tidy DataFrame ready to write to CSV and to feed the Excel builder.
+    For each symbol and side, compute percentile depth tables per level, across all snapshots.
+    Returns a dict: {percentile: DataFrame} for each requested percentile.
     """
-    rows = []
-    for symbol, blob in results.items():
-        sdf = blob['df']
-        for side in ('bids', 'asks'):
-            buckets = _collect_levels_for_symbol(sdf, side)
-            acc_qty = 0.0
-            acc_usd = 0.0
-            for lvl in sorted(buckets.keys()):
-                b = buckets[lvl]
-                pct_p = _percentile(b['pct_diff'], q)
-                qty_p = _percentile(b['qty'], q)
-                usd_p = _percentile(b['usd'], q)
-                if not np.isnan(qty_p):
-                    acc_qty += qty_p
-                if not np.isnan(usd_p):
-                    acc_usd += usd_p
-                rows.append({
-                    'symbol': symbol,
-                    'side': 'bid' if side == 'bids' else 'ask',
-                    'level': lvl,
-                    'pct_diff': round(pct_p, 3) if not np.isnan(pct_p) else np.nan,
-                    'qty': round(qty_p, 6) if not np.isnan(qty_p) else np.nan,
-                    'usd': round(usd_p, 2) if not np.isnan(usd_p) else np.nan,
-                    'acc_qty': round(acc_qty, 6) if not np.isnan(acc_qty) else np.nan,
-                    'acc_usd': round(acc_usd, 2) if not np.isnan(acc_usd) else np.nan,
-                    'obs_count': len(b['qty'])
-                })
-    df = pd.DataFrame(rows)
-    if not df.empty:
-        df = df.sort_values(['symbol', 'side', 'level']).reset_index(drop=True)
-    return df
+    percentile_dfs = {}
+    
+    for perc in percentiles:
+        q = perc / 100.0
+        rows = []
+        
+        for symbol, blob in results.items():
+            sdf = blob['df']
+            for side in ('bids', 'asks'):
+                buckets = _collect_levels_for_symbol(sdf, side)
+                acc_qty = 0.0
+                acc_usd = 0.0
+                for lvl in sorted(buckets.keys()):
+                    b = buckets[lvl]
+                    pct_p = _percentile(b['pct_diff'], q)
+                    qty_p = _percentile(b['qty'], q)
+                    usd_p = _percentile(b['usd'], q)
+                    if not np.isnan(qty_p):
+                        acc_qty += qty_p
+                    if not np.isnan(usd_p):
+                        acc_usd += usd_p
+                    rows.append({
+                        'symbol': symbol,
+                        'side': 'bid' if side == 'bids' else 'ask',
+                        'level': lvl,
+                        'pct_diff': round(pct_p, 3) if not np.isnan(pct_p) else np.nan,
+                        'qty': round(qty_p, 6) if not np.isnan(qty_p) else np.nan,
+                        'usd': round(usd_p, 2) if not np.isnan(usd_p) else np.nan,
+                        'acc_qty': round(acc_qty, 6) if not np.isnan(acc_qty) else np.nan,
+                        'acc_usd': round(acc_usd, 2) if not np.isnan(acc_usd) else np.nan,
+                        'obs_count': len(b['qty'])
+                    })
+        
+        df = pd.DataFrame(rows)
+        if not df.empty:
+            df = df.sort_values(['symbol', 'side', 'level']).reset_index(drop=True)
+        percentile_dfs[perc] = df
+    
+    return percentile_dfs
 
-def save_percentile_depth_csv(results: Dict, output_csv: str = CSV_PCT_FILENAME, q: float = PERC_Q) -> Path:
-    df = build_percentile_depth(results, q=q)
-    out_path = Path(output_csv)
-    df.rename(columns={
-        'pct_diff': f'pct_diff_p{int(q*100):02d}',
-        'qty':      f'qty_p{int(q*100):02d}',
-        'usd':      f'usd_p{int(q*100):02d}',
-        'acc_qty':  f'acc_qty_p{int(q*100):02d}',
-        'acc_usd':  f'acc_usd_p{int(q*100):02d}',
-    }).to_csv(out_path, index=False)
-    return out_path
+def save_percentile_depth_csvs(results: Dict, percentiles: List[int]) -> List[Path]:
+    """
+    Save CSV files for each percentile.
+    Returns list of output file paths.
+    """
+    percentile_dfs = build_percentile_depth(results, percentiles)
+    output_paths = []
+    
+    for perc, df in percentile_dfs.items():
+        output_csv = f"orderbook_levels_p{perc:02d}.csv"
+        out_path = Path(output_csv)
+        
+        # Rename columns to include percentile
+        df_renamed = df.rename(columns={
+            'pct_diff': f'pct_diff_p{perc:02d}',
+            'qty':      f'qty_p{perc:02d}',
+            'usd':      f'usd_p{perc:02d}',
+            'acc_qty':  f'acc_qty_p{perc:02d}',
+            'acc_usd':  f'acc_usd_p{perc:02d}',
+        })
+        
+        df_renamed.to_csv(out_path, index=False)
+        output_paths.append(out_path)
+    
+    return output_paths
 
 # ----------------------------------------------------------------------------
-# Excel builder (Table 4 uses leverage data, Table 5 uses percentile data)
+# Excel builder (now handles multiple percentile tables)
 # ----------------------------------------------------------------------------
 
 def _fmt_price(p: float) -> str:
@@ -332,7 +362,20 @@ def _fmt_price(p: float) -> str:
     if p >= 1:    return f"{p:.2f}"
     return f"{p:.4f}"
 
-def create_excel_tables(results: Dict, pct_df: pd.DataFrame, output_filename: str = EXCEL_FILENAME, q: float = PERC_Q) -> None:
+def _get_percentile_colors(perc: int) -> Tuple[PatternFill, PatternFill]:
+    """Get colors for bid/ask tables based on percentile."""
+    # Darker colors for lower percentiles (more conservative)
+    if perc <= 5:
+        return (PatternFill(start_color="D4F3D4", end_color="D4F3D4", fill_type="solid"),  # Light green
+                PatternFill(start_color="FFE4E4", end_color="FFE4E4", fill_type="solid"))  # Light red
+    elif perc <= 25:
+        return (PatternFill(start_color="E8F5E8", end_color="E8F5E8", fill_type="solid"),  # Medium green  
+                PatternFill(start_color="FFF2F2", end_color="FFF2F2", fill_type="solid"))  # Medium red
+    else:
+        return (PatternFill(start_color="F0F8F0", end_color="F0F8F0", fill_type="solid"),  # Light green
+                PatternFill(start_color="FFF8F8", end_color="FFF8F8", fill_type="solid"))  # Light red
+
+def create_excel_tables(results: Dict, percentiles: List[int], output_filename: str = EXCEL_FILENAME) -> None:
     workbook = openpyxl.Workbook()
     ws = workbook.active
     ws.title = "Trading Analysis"
@@ -341,13 +384,14 @@ def create_excel_tables(results: Dict, pct_df: pd.DataFrame, output_filename: st
     header_fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
     title_font  = Font(bold=True, size=14, color="000000")
     center      = Alignment(horizontal="center", vertical="center")
-    pos_fill    = PatternFill(start_color="E8F5E8", end_color="E8F5E8", fill_type="solid")
-    neg_fill    = PatternFill(start_color="FFF2F2", end_color="FFF2F2", fill_type="solid")
     leverage_fill = PatternFill(start_color="FFF8DC", end_color="FFF8DC", fill_type="solid")
 
     symbols = list(results.keys())
     time_labels = ["3min", "5min", "10min", "30min", "60min", "90min", "1day", "1year"]
     vol_keys    = ['3min_vol','5min_vol','10min_vol','30min_vol','60min_vol','90min_vol','1day_vol','1year_vol']
+
+    # Build percentile data for all requested percentiles
+    percentile_dfs = build_percentile_depth(results, percentiles)
 
     row = 1
     ws.cell(row=row, column=1, value="NOTE: All percentage values in tables below are numbers without % symbol for easier Excel editing").font = Font(italic=True, size=10, color="666666")
@@ -487,110 +531,118 @@ def create_excel_tables(results: Dict, pct_df: pd.DataFrame, output_filename: st
 
     row += 2
 
-    # TABLE 5: Orderbook Levels Percentile Tables
-    p_label = f"p{int(q*100):02d}"
-    ws.cell(row=row, column=1, value=f"5. Orderbook Levels Analysis ({p_label}) - % Difference from Base Price (per level, across snapshots)").font = title_font
-    row += 2
+    # TABLES 5+: Orderbook Levels Percentile Tables (one for each percentile)
+    table_num = 5
+    for perc in sorted(percentiles):
+        pct_df = percentile_dfs[perc]
+        pos_fill, neg_fill = _get_percentile_colors(perc)
+        
+        ws.cell(row=row, column=1, value=f"{table_num}. Orderbook Levels Analysis (p{perc:02d}) - % Difference from Base Price").font = title_font
+        row += 2
 
-    # ----- BID TABLE -----
-    ws.cell(row=row, column=1, value="BID LEVELS (% Below Base Price)").font = Font(bold=True, color="008000")
-    row += 1
+        # ----- BID TABLE -----
+        ws.cell(row=row, column=1, value=f"BID LEVELS p{perc:02d} (% Below Base Price)").font = Font(bold=True, color="008000")
+        row += 1
 
-    ws.cell(row=row, column=1, value="Level").font = header_font
-    ws.cell(row=row, column=1).fill = header_fill
-    ws.cell(row=row, column=1).alignment = center
+        ws.cell(row=row, column=1, value="Level").font = header_font
+        ws.cell(row=row, column=1).fill = header_fill
+        ws.cell(row=row, column=1).alignment = center
 
-    col = 2
-    for sym in symbols:
-        for hdr in [f"{sym} %", f"{sym} Qty", f"{sym} USD", f"{sym} Acc Qty", f"{sym} Acc USD"]:
-            ws.cell(row=row, column=col, value=hdr).font = header_font
-            ws.cell(row=row, column=col).fill = header_fill
-            ws.cell(row=row, column=col).alignment = center
-            col += 1
-    row += 1
-
-    # Compute max bid level across symbols from percentile DF
-    max_bid_level = 0
-    for sym in symbols:
-        r = pct_df[(pct_df['symbol']==sym) & (pct_df['side']=='bid')]['level']
-        if not r.empty:
-            max_bid_level = max(max_bid_level, int(r.max()))
-
-    for lvl in range(1, max_bid_level+1):
-        ws.cell(row=row, column=1, value=lvl).alignment = center
-        ws.cell(row=row, column=1).font = Font(bold=True)
         col = 2
         for sym in symbols:
-            r = pct_df[(pct_df['symbol']==sym) & (pct_df['side']=='bid') & (pct_df['level']==lvl)]
-            if len(r)==1:
-                pct, qty, usd, accq, accusd = r.iloc[0][['pct_diff','qty','usd','acc_qty','acc_usd']]
-                cells = [pct, qty, usd, accq, accusd]
-                fills = [pos_fill]*5
-            else:
-                cells = ["N/A"]*5
-                fills = [pos_fill]*5
-            for val, f in zip(cells, fills):
-                if isinstance(val, (int, float)) and not (isinstance(val, float) and np.isnan(val)):
-                    disp = round(val, 3) if isinstance(val, float) else val
-                else:
-                    disp = "N/A"
-                c = ws.cell(row=row, column=col, value=disp)
-                c.alignment = center
-                c.fill = f
+            for hdr in [f"{sym} %", f"{sym} Qty", f"{sym} USD", f"{sym} Acc Qty", f"{sym} Acc USD"]:
+                ws.cell(row=row, column=col, value=hdr).font = header_font
+                ws.cell(row=row, column=col).fill = header_fill
+                ws.cell(row=row, column=col).alignment = center
                 col += 1
         row += 1
 
-    row += 1
+        # Compute max bid level for this percentile
+        max_bid_level = 0
+        for sym in symbols:
+            r = pct_df[(pct_df['symbol']==sym) & (pct_df['side']=='bid')]['level']
+            if not r.empty:
+                max_bid_level = max(max_bid_level, int(r.max()))
 
-    # ----- ASK TABLE -----
-    ws.cell(row=row, column=1, value="ASK LEVELS (% Above Base Price)").font = Font(bold=True, color="CC0000")
-    row += 1
+        for lvl in range(1, max_bid_level+1):
+            ws.cell(row=row, column=1, value=lvl).alignment = center
+            ws.cell(row=row, column=1).font = Font(bold=True)
+            col = 2
+            for sym in symbols:
+                r = pct_df[(pct_df['symbol']==sym) & (pct_df['side']=='bid') & (pct_df['level']==lvl)]
+                if len(r)==1:
+                    pct_val, qty, usd, accq, accusd = r.iloc[0][['pct_diff','qty','usd','acc_qty','acc_usd']]
+                    cells = [pct_val, qty, usd, accq, accusd]
+                    fills = [pos_fill]*5
+                else:
+                    cells = ["N/A"]*5
+                    fills = [pos_fill]*5
+                for val, f in zip(cells, fills):
+                    if isinstance(val, (int, float)) and not (isinstance(val, float) and np.isnan(val)):
+                        disp = round(val, 3) if isinstance(val, float) else val
+                    else:
+                        disp = "N/A"
+                    c = ws.cell(row=row, column=col, value=disp)
+                    c.alignment = center
+                    c.fill = f
+                    col += 1
+            row += 1
 
-    ws.cell(row=row, column=1, value="Level").font = header_font
-    ws.cell(row=row, column=1).fill = header_fill
-    ws.cell(row=row, column=1).alignment = center
+        row += 1
 
-    col = 2
-    for sym in symbols:
-        for hdr in [f"{sym} %", f"{sym} Qty", f"{sym} USD", f"{sym} Acc Qty", f"{sym} Acc USD"]:
-            ws.cell(row=row, column=col, value=hdr).font = header_font
-            ws.cell(row=row, column=col).fill = header_fill
-            ws.cell(row=row, column=col).alignment = center
-            col += 1
-    row += 1
+        # ----- ASK TABLE -----
+        ws.cell(row=row, column=1, value=f"ASK LEVELS p{perc:02d} (% Above Base Price)").font = Font(bold=True, color="CC0000")
+        row += 1
 
-    max_ask_level = 0
-    for sym in symbols:
-        r = pct_df[(pct_df['symbol']==sym) & (pct_df['side']=='ask')]['level']
-        if not r.empty:
-            max_ask_level = max(max_ask_level, int(r.max()))
+        ws.cell(row=row, column=1, value="Level").font = header_font
+        ws.cell(row=row, column=1).fill = header_fill
+        ws.cell(row=row, column=1).alignment = center
 
-    for lvl in range(1, max_ask_level+1):
-        ws.cell(row=row, column=1, value=lvl).alignment = center
-        ws.cell(row=row, column=1).font = Font(bold=True)
         col = 2
         for sym in symbols:
-            r = pct_df[(pct_df['symbol']==sym) & (pct_df['side']=='ask') & (pct_df['level']==lvl)]
-            if len(r)==1:
-                pct, qty, usd, accq, accusd = r.iloc[0][['pct_diff','qty','usd','acc_qty','acc_usd']]
-                cells = [pct, qty, usd, accq, accusd]
-                fills = [neg_fill]*5
-            else:
-                cells = ["N/A"]*5
-                fills = [neg_fill]*5
-            for val, f in zip(cells, fills):
-                if isinstance(val, (int, float)) and not (isinstance(val, float) and np.isnan(val)):
-                    disp = round(val, 3) if isinstance(val, float) else val
-                else:
-                    disp = "N/A"
-                c = ws.cell(row=row, column=col, value=disp)
-                c.alignment = center
-                c.fill = f
+            for hdr in [f"{sym} %", f"{sym} Qty", f"{sym} USD", f"{sym} Acc Qty", f"{sym} Acc USD"]:
+                ws.cell(row=row, column=col, value=hdr).font = header_font
+                ws.cell(row=row, column=col).fill = header_fill
+                ws.cell(row=row, column=col).alignment = center
                 col += 1
         row += 1
+
+        max_ask_level = 0
+        for sym in symbols:
+            r = pct_df[(pct_df['symbol']==sym) & (pct_df['side']=='ask')]['level']
+            if not r.empty:
+                max_ask_level = max(max_ask_level, int(r.max()))
+
+        for lvl in range(1, max_ask_level+1):
+            ws.cell(row=row, column=1, value=lvl).alignment = center
+            ws.cell(row=row, column=1).font = Font(bold=True)
+            col = 2
+            for sym in symbols:
+                r = pct_df[(pct_df['symbol']==sym) & (pct_df['side']=='ask') & (pct_df['level']==lvl)]
+                if len(r)==1:
+                    pct_val, qty, usd, accq, accusd = r.iloc[0][['pct_diff','qty','usd','acc_qty','acc_usd']]
+                    cells = [pct_val, qty, usd, accq, accusd]
+                    fills = [neg_fill]*5
+                else:
+                    cells = ["N/A"]*5
+                    fills = [neg_fill]*5
+                for val, f in zip(cells, fills):
+                    if isinstance(val, (int, float)) and not (isinstance(val, float) and np.isnan(val)):
+                        disp = round(val, 3) if isinstance(val, float) else val
+                    else:
+                        disp = "N/A"
+                    c = ws.cell(row=row, column=col, value=disp)
+                    c.alignment = center
+                    c.fill = f
+                    col += 1
+            row += 1
+
+        row += 3  # Extra space between percentile tables
+        table_num += 1
 
     # Adjust column widths
     ws.column_dimensions['A'].width = 12
+    
     # Table 1-3: Base columns
     base_cols = len(symbols)+1
     for c in range(2, base_cols+1):
@@ -603,7 +655,7 @@ def create_excel_tables(results: Dict, pct_df: pd.DataFrame, output_filename: st
     ws.column_dimensions[get_column_letter(5)].width = 8   # Status
     ws.column_dimensions[get_column_letter(6)].width = 40  # Leverage Tiers
     
-    # Table 5: Orderbook levels
+    # Table 5+: Orderbook levels
     total_cols = len(symbols)*5 + 1
     for c in range(2, total_cols+1):
         ws.column_dimensions[get_column_letter(c)].width = 12
@@ -611,43 +663,76 @@ def create_excel_tables(results: Dict, pct_df: pd.DataFrame, output_filename: st
     workbook.save(output_filename)
 
 # ----------------------------------------------------------------------------
+# Argument parsing
+# ----------------------------------------------------------------------------
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(
+        description="Volatility and orderbook analysis with configurable percentiles",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python volatility.py data.csv                          # Default percentiles [1, 10, 25, 50]
+  python volatility.py data.csv BTC ETH SOL             # Specific symbols, default percentiles
+  python volatility.py data.csv --percentiles 5 25 50   # Custom percentiles
+  python volatility.py data.csv BTC --percentiles 1 90  # Symbols + custom percentiles
+        """
+    )
+    
+    parser.add_argument('csv_file', help='Path to CSV file with orderbook data')
+    parser.add_argument('symbols', nargs='*', help='Optional: specific symbols to analyze')
+    parser.add_argument('--percentiles', nargs='+', type=int, default=DEFAULT_PERCENTILES,
+                       help=f'Percentiles to calculate (1-99). Default: {DEFAULT_PERCENTILES}')
+    
+    args = parser.parse_args()
+    
+    # Validate percentiles
+    for p in args.percentiles:
+        if not 1 <= p <= 99:
+            parser.error(f"Percentile {p} must be between 1 and 99")
+    
+    # Sort percentiles for consistent output
+    args.percentiles = sorted(set(args.percentiles))
+    
+    return args
+
+# ----------------------------------------------------------------------------
 # CLI
 # ----------------------------------------------------------------------------
 
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: python volatility.py <csv_file> [symbol1] [symbol2] ...")
-        sys.exit(1)
-
-    csv_path = sys.argv[1]
-    symbol_filters = sys.argv[2:] if len(sys.argv) > 2 else None
-
-    if not Path(csv_path).exists():
-        raise SystemExit(f"CSV file not found: {csv_path}")
+    args = parse_arguments()
+    
+    if not Path(args.csv_file).exists():
+        raise SystemExit(f"CSV file not found: {args.csv_file}")
 
     print("Starting analysis...")
+    print(f"Requested percentiles: {args.percentiles}")
+    if args.symbols:
+        print(f"Filtering symbols: {args.symbols}")
     
-    # Analyze (now includes leverage fetching)
-    results = analyze_csv(csv_path, symbol_filters)
+    # Analyze (includes leverage fetching)
+    results = analyze_csv(args.csv_file, args.symbols)
 
-    # Build percentile depth (global across all snapshots)
-    print("Building percentile depth tables...")
-    pct_df = build_percentile_depth(results, q=PERC_Q)
+    # Save CSV files for each percentile
+    print("Saving CSV files...")
+    csv_paths = save_percentile_depth_csvs(results, args.percentiles)
+    for path in csv_paths:
+        print(f"  Wrote -> {path}")
 
-    # Save big CSV
-    print("Saving CSV...")
-    out_csv = save_percentile_depth_csv(results, output_csv=CSV_PCT_FILENAME, q=PERC_Q)
-    print(f"Wrote percentile depth CSV -> {out_csv}")
-
-    # Excel workbook (uses percentile tables for Table 5, leverage for Table 4)
+    # Excel workbook (includes all percentile tables)
     print("Creating Excel workbook...")
-    create_excel_tables(results, pct_df, output_filename=EXCEL_FILENAME, q=PERC_Q)
+    create_excel_tables(results, args.percentiles, output_filename=EXCEL_FILENAME)
     print(f"Wrote Excel workbook -> {EXCEL_FILENAME}")
 
     # Print summary
-    print("\n" + "="*50)
+    print("\n" + "="*60)
     print("ANALYSIS SUMMARY")
-    print("="*50)
+    print("="*60)
+    print(f"Percentiles analyzed: {args.percentiles}")
+    print(f"CSV files created: {len(csv_paths)}")
+    print(f"Excel tables: 4 + {len(args.percentiles)} percentile tables")
+    print("-"*60)
     for symbol in results.keys():
         lev_info = results[symbol]['leverage_info']
         status = "✓" if lev_info['status'] == 'success' else "✗"
