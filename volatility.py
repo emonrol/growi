@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Volatility Calculator + Orderbook Percentile Depth Tables (5-minute snapshots)
+Volatility Calculator + Orderbook Percentile Depth Tables + Leverage Information (5-minute snapshots)
 
 This version EXPLICITLY imports your shared utilities from:
     /home/eric/Documents/growi/orderbook_utils.py
+
+And now also fetches leverage information using API.py
 
 What this script does
 ---------------------
@@ -15,19 +17,22 @@ What this script does
 
 2) Computes standard volatility metrics (scaled from 5-min returns).
 
-3) Builds *percentile* orderbook depth tables, per **level** across **all snapshots**:
+3) Fetches leverage information for each asset from Hyperliquid API.
+
+4) Builds *percentile* orderbook depth tables, per **level** across **all snapshots**:
    - For each (symbol, side, level):
        pct_diff_pXX : percentile of % difference between level px and base_price
        qty_pXX      : percentile of level size in asset units
        usd_pXX      : percentile of level USD value (price * qty)
      Accumulated columns are cumulative sums of the percentile values by level.
 
-4) Writes TWO outputs:
+5) Writes TWO outputs:
    - Excel file (volatility_analysis.xlsx) with:
        Table 1: Volatility (% numbers, no % symbol)
        Table 2: Buy target prices (base + vol)
        Table 3: Sell target prices (base - vol)
-       Table 4: BID & ASK level tables using **percentile values across all snapshots**
+       Table 4: Leverage information per symbol
+       Table 5: BID & ASK level tables using **percentile values across all snapshots**
    - Big CSV (orderbook_levels_p01.csv) with the percentile-by-level rows for all symbols/sides.
 
 Usage
@@ -63,6 +68,9 @@ from orderbook_utils import (
     validate_required_columns,
     REQUIRED_CSV_COLUMNS,
 )
+
+# Import API module for leverage information
+from API import effective_max_leverage_for_notional, HLMetaError
 
 # ----------------------------------------------------------------------------
 # Config
@@ -106,6 +114,65 @@ def calculate_volatility_metrics(log_returns: pd.Series) -> Dict[str, float]:
     }
 
 # ----------------------------------------------------------------------------
+# Leverage fetching helper
+# ----------------------------------------------------------------------------
+
+def fetch_leverage_info(symbol: str, dex: str = "") -> Dict:
+    """
+    Fetch leverage information for a symbol.
+    
+    Returns:
+        Dict with leverage info or error info if failed
+    """
+    try:
+        leverage_data = effective_max_leverage_for_notional(symbol, dex=dex)
+        if symbol in leverage_data:
+            tiers = leverage_data[symbol]
+            # Process tiers for easier handling
+            max_leverage = max(lev for _, lev in tiers) if tiers else 0
+            min_leverage = min(lev for _, lev in tiers) if tiers else 0
+            num_tiers = len(tiers)
+            
+            return {
+                'status': 'success',
+                'max_leverage': max_leverage,
+                'min_leverage': min_leverage,
+                'num_tiers': num_tiers,
+                'tiers': tiers,
+                'tiers_formatted': [(f"${lb:,.0f}", f"{lev}x") for lb, lev in tiers]
+            }
+        else:
+            return {
+                'status': 'error',
+                'error': f'Symbol {symbol} not found in API response',
+                'max_leverage': 0,
+                'min_leverage': 0,
+                'num_tiers': 0,
+                'tiers': [],
+                'tiers_formatted': []
+            }
+    except HLMetaError as e:
+        return {
+            'status': 'error',
+            'error': f'HLMetaError: {str(e)}',
+            'max_leverage': 0,
+            'min_leverage': 0,
+            'num_tiers': 0,
+            'tiers': [],
+            'tiers_formatted': []
+        }
+    except Exception as e:
+        return {
+            'status': 'error',
+            'error': f'Unexpected error: {str(e)}',
+            'max_leverage': 0,
+            'min_leverage': 0,
+            'num_tiers': 0,
+            'tiers': [],
+            'tiers_formatted': []
+        }
+
+# ----------------------------------------------------------------------------
 # Core analysis
 # ----------------------------------------------------------------------------
 
@@ -134,6 +201,7 @@ def analyze_csv(csv_path: str, symbol_filters: Optional[list] = None) -> Dict:
     results = {}
 
     for symbol in df['symbol'].unique():
+        print(f"Processing {symbol}...")
         sdf = df[df['symbol'] == symbol].copy()
         prices = sdf['base_price'].astype(float)
         if 'ts' in sdf.columns:
@@ -141,10 +209,17 @@ def analyze_csv(csv_path: str, symbol_filters: Optional[list] = None) -> Dict:
 
         log_returns = calculate_log_returns(prices)
         vol_metrics = calculate_volatility_metrics(log_returns)
+        
+        # Fetch leverage information
+        print(f"  Fetching leverage info for {symbol}...")
+        leverage_info = fetch_leverage_info(symbol)
+        if leverage_info['status'] == 'error':
+            print(f"  Warning: Could not fetch leverage for {symbol}: {leverage_info['error']}")
 
         results[symbol] = {
             'df': sdf,
             'volatility_metrics': vol_metrics,
+            'leverage_info': leverage_info,
             'price_stats': {
                 'min_price': prices.min(),
                 'max_price': prices.max(),
@@ -248,7 +323,7 @@ def save_percentile_depth_csv(results: Dict, output_csv: str = CSV_PCT_FILENAME,
     return out_path
 
 # ----------------------------------------------------------------------------
-# Excel builder (Table 4 uses percentile data)
+# Excel builder (Table 4 uses leverage data, Table 5 uses percentile data)
 # ----------------------------------------------------------------------------
 
 def _fmt_price(p: float) -> str:
@@ -268,6 +343,7 @@ def create_excel_tables(results: Dict, pct_df: pd.DataFrame, output_filename: st
     center      = Alignment(horizontal="center", vertical="center")
     pos_fill    = PatternFill(start_color="E8F5E8", end_color="E8F5E8", fill_type="solid")
     neg_fill    = PatternFill(start_color="FFF2F2", end_color="FFF2F2", fill_type="solid")
+    leverage_fill = PatternFill(start_color="FFF8DC", end_color="FFF8DC", fill_type="solid")
 
     symbols = list(results.keys())
     time_labels = ["3min", "5min", "10min", "30min", "60min", "90min", "1day", "1year"]
@@ -358,9 +434,62 @@ def create_excel_tables(results: Dict, pct_df: pd.DataFrame, output_filename: st
 
     row += 2
 
-    # TABLE 4: Orderbook Levels Percentile Tables
+    # TABLE 4: Leverage Information
+    ws.cell(row=row, column=1, value="4. Leverage Information").font = title_font
+    row += 2
+
+    # Headers for leverage table
+    headers = ["Symbol", "Max Leverage", "Min Leverage", "Tiers Count", "Status", "Leverage Tiers"]
+    for c, hdr in enumerate(headers, start=1):
+        cell = ws.cell(row=row, column=c, value=hdr)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = center
+    row += 1
+
+    # Data rows for leverage
+    for sym in symbols:
+        lev_info = results[sym]['leverage_info']
+        
+        # Symbol
+        ws.cell(row=row, column=1, value=sym).alignment = center
+        ws.cell(row=row, column=1).font = Font(bold=True)
+        ws.cell(row=row, column=1).fill = leverage_fill
+        
+        # Max Leverage
+        max_lev = f"{lev_info['max_leverage']}x" if lev_info['max_leverage'] > 0 else "N/A"
+        ws.cell(row=row, column=2, value=max_lev).alignment = center
+        ws.cell(row=row, column=2).fill = leverage_fill
+        
+        # Min Leverage
+        min_lev = f"{lev_info['min_leverage']}x" if lev_info['min_leverage'] > 0 else "N/A"
+        ws.cell(row=row, column=3, value=min_lev).alignment = center
+        ws.cell(row=row, column=3).fill = leverage_fill
+        
+        # Tiers Count
+        ws.cell(row=row, column=4, value=lev_info['num_tiers']).alignment = center
+        ws.cell(row=row, column=4).fill = leverage_fill
+        
+        # Status
+        status = "✓" if lev_info['status'] == 'success' else "✗"
+        ws.cell(row=row, column=5, value=status).alignment = center
+        ws.cell(row=row, column=5).fill = leverage_fill
+        
+        # Leverage Tiers (formatted as text)
+        if lev_info['tiers_formatted']:
+            tiers_text = "; ".join([f"{lb} → {lev}" for lb, lev in lev_info['tiers_formatted']])
+        else:
+            tiers_text = "N/A"
+        ws.cell(row=row, column=6, value=tiers_text).alignment = Alignment(horizontal="left", vertical="center")
+        ws.cell(row=row, column=6).fill = leverage_fill
+        
+        row += 1
+
+    row += 2
+
+    # TABLE 5: Orderbook Levels Percentile Tables
     p_label = f"p{int(q*100):02d}"
-    ws.cell(row=row, column=1, value=f"4. Orderbook Levels Analysis ({p_label}) - % Difference from Base Price (per level, across snapshots)").font = title_font
+    ws.cell(row=row, column=1, value=f"5. Orderbook Levels Analysis ({p_label}) - % Difference from Base Price (per level, across snapshots)").font = title_font
     row += 2
 
     # ----- BID TABLE -----
@@ -460,13 +589,21 @@ def create_excel_tables(results: Dict, pct_df: pd.DataFrame, output_filename: st
                 col += 1
         row += 1
 
-    # Widths
-    ws.column_dimensions['A'].width = 10
-    # Table 1-3
+    # Adjust column widths
+    ws.column_dimensions['A'].width = 12
+    # Table 1-3: Base columns
     base_cols = len(symbols)+1
     for c in range(2, base_cols+1):
         ws.column_dimensions[get_column_letter(c)].width = 15
-    # Table 4
+    
+    # Table 4: Leverage table columns
+    ws.column_dimensions[get_column_letter(2)].width = 12  # Max Leverage
+    ws.column_dimensions[get_column_letter(3)].width = 12  # Min Leverage
+    ws.column_dimensions[get_column_letter(4)].width = 10  # Tiers Count
+    ws.column_dimensions[get_column_letter(5)].width = 8   # Status
+    ws.column_dimensions[get_column_letter(6)].width = 40  # Leverage Tiers
+    
+    # Table 5: Orderbook levels
     total_cols = len(symbols)*5 + 1
     for c in range(2, total_cols+1):
         ws.column_dimensions[get_column_letter(c)].width = 12
@@ -488,19 +625,34 @@ def main():
     if not Path(csv_path).exists():
         raise SystemExit(f"CSV file not found: {csv_path}")
 
-    # Analyze
+    print("Starting analysis...")
+    
+    # Analyze (now includes leverage fetching)
     results = analyze_csv(csv_path, symbol_filters)
 
     # Build percentile depth (global across all snapshots)
+    print("Building percentile depth tables...")
     pct_df = build_percentile_depth(results, q=PERC_Q)
 
     # Save big CSV
+    print("Saving CSV...")
     out_csv = save_percentile_depth_csv(results, output_csv=CSV_PCT_FILENAME, q=PERC_Q)
     print(f"Wrote percentile depth CSV -> {out_csv}")
 
-    # Excel workbook (uses percentile tables for Table 4)
+    # Excel workbook (uses percentile tables for Table 5, leverage for Table 4)
+    print("Creating Excel workbook...")
     create_excel_tables(results, pct_df, output_filename=EXCEL_FILENAME, q=PERC_Q)
     print(f"Wrote Excel workbook -> {EXCEL_FILENAME}")
+
+    # Print summary
+    print("\n" + "="*50)
+    print("ANALYSIS SUMMARY")
+    print("="*50)
+    for symbol in results.keys():
+        lev_info = results[symbol]['leverage_info']
+        status = "✓" if lev_info['status'] == 'success' else "✗"
+        max_lev = f"{lev_info['max_leverage']}x" if lev_info['max_leverage'] > 0 else "N/A"
+        print(f"{symbol:>6}: Max Leverage {max_lev:>5} | Status {status}")
 
 if __name__ == "__main__":
     main()
