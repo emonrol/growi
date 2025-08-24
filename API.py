@@ -100,12 +100,13 @@ def pick_margin_table_id_for_asset(asset: Dict, margin_tables: Dict[int, Dict]) 
 
 def effective_max_leverage_for_notional(
     token: str,
-    notional_usdc: float,
+    notional_usdc: float = 0.0,
     dex: str = "",
     override_margin_table_id: Optional[int] = None
-) -> Dict:
+) -> Dict[str, List[Tuple[float, int]]]:
     """
-    Returns a clean dict with { 'token': str, 'tiers': List[(lowerBound, maxLeverage)] }.
+    Returns { token: [(lowerBound, maxLeverage), ...] }
+    Example: { "BTC": [(0.0, 40), (150000000.0, 20)] }
     """
     meta = fetch_perp_meta(dex=dex)
     uni = _index_universe(meta["universe"])
@@ -114,7 +115,7 @@ def effective_max_leverage_for_notional(
     asset = uni[token]
     tables = _index_margin_tables(meta["marginTables"])
 
-    # Choose margin table
+    # Pick correct table
     table_id = override_margin_table_id or pick_margin_table_id_for_asset(asset, tables)
     if table_id is None:
         available = {tid: tables[tid]["description"] for tid in sorted(tables)}
@@ -125,11 +126,7 @@ def effective_max_leverage_for_notional(
 
     tiers = tables[table_id]["tiers"]
 
-    return {
-        "token": token,
-        "tiers": tiers
-    }
-
+    return {token: tiers}
 
 # --- Example usage ---
 if __name__ == "__main__":
