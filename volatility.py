@@ -1,677 +1,506 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-Volatility Calculator for 5-minute orderbook data.
+Volatility Calculator + Orderbook Percentile Depth Tables (5-minute snapshots)
 
-Reads CSV files with 5-minute price updates and calculates:
-- Multiple time period volatilities (3, 5, 10, 30, 60, 90 minutes, 1 day, 1 year)
-- Exports results to Excel with formatted tables
+This version EXPLICITLY imports your shared utilities from:
+    /home/eric/Documents/growi/orderbook_utils.py
+
+What this script does
+---------------------
+1) Reads CSVs with 5-minute snapshots of many crypto pairs.
+   Required columns: ts, symbol, base_price, bids, asks
+   - bids / asks are blob strings that may be messy; we normalize them using
+     parse_orderbook_blob(...) from your shared module.
+
+2) Computes standard volatility metrics (scaled from 5-min returns).
+
+3) Builds *percentile* orderbook depth tables, per **level** across **all snapshots**:
+   - For each (symbol, side, level):
+       pct_diff_pXX : percentile of % difference between level px and base_price
+       qty_pXX      : percentile of level size in asset units
+       usd_pXX      : percentile of level USD value (price * qty)
+     Accumulated columns are cumulative sums of the percentile values by level.
+
+4) Writes TWO outputs:
+   - Excel file (volatility_analysis.xlsx) with:
+       Table 1: Volatility (% numbers, no % symbol)
+       Table 2: Buy target prices (base + vol)
+       Table 3: Sell target prices (base - vol)
+       Table 4: BID & ASK level tables using **percentile values across all snapshots**
+   - Big CSV (orderbook_levels_p01.csv) with the percentile-by-level rows for all symbols/sides.
+
+Usage
+-----
+python volatility.py your_data.csv               # all symbols
+python volatility.py your_data.csv BTC ETH SOL   # subset of symbols
+
+Notes
+-----
+- Default percentile is p01 (=1%) which means: in 99% of snapshots the level has at least
+  these quantities/values. You can change PERC_Q if you want a different percentile.
 """
 
-import pandas as pd
-import numpy as np
-import sys
 import json
+import sys
 from pathlib import Path
 from typing import Optional, Dict, Tuple, List
-from orderbook_utils import validate_required_columns, REQUIRED_CSV_COLUMNS
+
+import numpy as np
+import pandas as pd
+
+# Optional Excel formatting (kept similar to your original script)
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
 
+# ----------------------------------------------------------------------------
+# Import your shared utilities from the exact path you specified
+# ----------------------------------------------------------------------------
+sys.path.append("/home/eric/Documents/growi")
+from orderbook_utils import (
+    parse_orderbook_blob,
+    validate_required_columns,
+    REQUIRED_CSV_COLUMNS,
+)
+
+# ----------------------------------------------------------------------------
+# Config
+# ----------------------------------------------------------------------------
+
+# Percentile to use (0.01 => p01). Change to 0.05 for p05, etc.
+PERC_Q = 0.5
+
+# Output filenames
+EXCEL_FILENAME = "volatility_analysis.xlsx"
+CSV_PCT_FILENAME = "orderbook_levels_p01.csv"
+
+# ----------------------------------------------------------------------------
+# Math helpers
+# ----------------------------------------------------------------------------
 
 def calculate_log_returns(prices: pd.Series) -> pd.Series:
-    """
-    Calculate logarithmic returns from price series.
-    
-    Args:
-        prices: Series of prices
-        
-    Returns:
-        Series of log returns (first value will be NaN)
-    """
-    # Remove any zero or negative prices (shouldn't happen but just in case)
     prices = prices[prices > 0]
-    
-    # Calculate log returns: ln(P_t / P_{t-1})
     log_returns = np.log(prices / prices.shift(1))
-    
     return log_returns.dropna()
 
-
-def parse_orderbook_levels(orderbook_str: str) -> Tuple[List[float], List[float]]:
-    """
-    Parse orderbook JSON string and extract all price levels and quantities.
-    
-    Args:
-        orderbook_str: JSON string containing orderbook data
-        
-    Returns:
-        Tuple of (prices, quantities) as lists of floats
-    """
-    try:
-        orderbook = json.loads(orderbook_str)
-        prices = [float(level["px"]) for level in orderbook]
-        quantities = [float(level["sz"]) for level in orderbook]
-        return prices, quantities
-    except (json.JSONDecodeError, KeyError, ValueError):
-        return [], []
-
-
 def calculate_volatility_metrics(log_returns: pd.Series) -> Dict[str, float]:
-    """
-    Calculate volatility metrics for multiple time periods from log returns.
-    
-    Args:
-        log_returns: Series of logarithmic returns (from 5-minute data)
-        
-    Returns:
-        Dictionary with volatility metrics for different time periods
-    """
     if len(log_returns) < 2:
         return {
-            '3min_vol': 0.0,
-            '5min_vol': 0.0,
-            '10min_vol': 0.0,
-            '30min_vol': 0.0,
-            '60min_vol': 0.0,
-            '90min_vol': 0.0,
-            '1day_vol': 0.0,
-            '1year_vol': 0.0,
-            'sample_size': len(log_returns)
+            '3min_vol': 0.0, '5min_vol': 0.0, '10min_vol': 0.0, '30min_vol': 0.0,
+            '60min_vol': 0.0, '90min_vol': 0.0, '1day_vol': 0.0, '1year_vol': 0.0,
+            'sample_size': len(log_returns), 'mean_return': 0.0
         }
-    
-    # 5-minute volatility (standard deviation of log returns) - this is our base
     vol_5min = log_returns.std()
-    
-    # Scale to different time periods using sqrt(time_ratio)
-    vol_3min = vol_5min * np.sqrt(3/5)        # 3 minutes
-    vol_10min = vol_5min * np.sqrt(10/5)      # 10 minutes = sqrt(2)
-    vol_30min = vol_5min * np.sqrt(30/5)      # 30 minutes = sqrt(6)
-    vol_60min = vol_5min * np.sqrt(60/5)      # 60 minutes = sqrt(12)
-    vol_90min = vol_5min * np.sqrt(90/5)      # 90 minutes = sqrt(18)
-    vol_1day = vol_5min * np.sqrt(1440/5)     # 1 day = 1440 minutes = sqrt(288)
-    vol_1year = vol_5min * np.sqrt(525600/5)  # 1 year = 525600 minutes = sqrt(105120)
-    
     return {
-        '3min_vol': vol_3min,
-        '5min_vol': vol_5min,
-        '10min_vol': vol_10min,
-        '30min_vol': vol_30min,
-        '60min_vol': vol_60min,
-        '90min_vol': vol_90min,
-        '1day_vol': vol_1day,
-        '1year_vol': vol_1year,
+        '3min_vol':  vol_5min * np.sqrt(3/5),
+        '5min_vol':  vol_5min,
+        '10min_vol': vol_5min * np.sqrt(10/5),
+        '30min_vol': vol_5min * np.sqrt(30/5),
+        '60min_vol': vol_5min * np.sqrt(60/5),
+        '90min_vol': vol_5min * np.sqrt(90/5),
+        '1day_vol':  vol_5min * np.sqrt(1440/5),
+        '1year_vol': vol_5min * np.sqrt(525600/5),
         'sample_size': len(log_returns),
         'mean_return': log_returns.mean()
     }
 
+# ----------------------------------------------------------------------------
+# Core analysis
+# ----------------------------------------------------------------------------
 
-def analyze_csv_volatility(csv_path: str, symbol_filters: Optional[list] = None) -> Dict:
-    """
-    Main function to analyze volatility from CSV file.
-    
-    Args:
-        csv_path: Path to CSV file
-        symbol_filters: Optional list of symbols to filter (e.g., ['BTCUSDT', 'ETHUSDT'])
-        
-    Returns:
-        Dictionary with analysis results
-    """
+def analyze_csv(csv_path: str, symbol_filters: Optional[list] = None) -> Dict:
     try:
         df = pd.read_csv(csv_path)
     except Exception as e:
         raise SystemExit(f"Error reading CSV: {e}")
-    
-    # Validate required columns
-    validate_required_columns(df.columns.tolist(), REQUIRED_CSV_COLUMNS)
-    
-    # Filter by symbols if specified
+
+    validate_required_columns(df.columns.tolist(), set(REQUIRED_CSV_COLUMNS))
+
     if symbol_filters:
         df = df[df['symbol'].isin(symbol_filters)]
         if len(df) == 0:
             raise SystemExit(f"No data found for symbols: {symbol_filters}")
-        
-        # Check which symbols were actually found
         found_symbols = df['symbol'].unique()
         missing_symbols = set(symbol_filters) - set(found_symbols)
         if missing_symbols:
             print(f"Warning: Symbols not found in data: {missing_symbols}")
-    
-    # Convert timestamp to datetime if it's not already
+
+    # Mixed timestamp formats supported
     if 'ts' in df.columns:
-        # Handle mixed timestamp formats (some with microseconds, some without)
         df['ts'] = pd.to_datetime(df['ts'], format='mixed')
         df = df.sort_values('ts')
-    
-    results = {} 
-    
-    # Analyze each symbol separately
+
+    results = {}
+
     for symbol in df['symbol'].unique():
-        symbol_data = df[df['symbol'] == symbol].copy()
-        
-        # Extract prices
-        prices = symbol_data['base_price'].astype(float)
-        
-        # Set datetime index for time series analysis
-        if 'ts' in symbol_data.columns:
-            prices.index = symbol_data['ts']
-        
-        # Calculate log returns
+        sdf = df[df['symbol'] == symbol].copy()
+        prices = sdf['base_price'].astype(float)
+        if 'ts' in sdf.columns:
+            prices.index = sdf['ts']
+
         log_returns = calculate_log_returns(prices)
-        
-        # Calculate volatility metrics
         vol_metrics = calculate_volatility_metrics(log_returns)
-        
-        # Parse orderbook data for levels (get latest snapshot)
-        latest_row = symbol_data.iloc[-1]
-        bid_levels = []
-        bid_quantities = []
-        ask_levels = []
-        ask_quantities = []
-        
-        if 'bids' in symbol_data.columns and pd.notna(latest_row['bids']):
-            bid_levels, bid_quantities = parse_orderbook_levels(latest_row['bids'])
-        
-        if 'asks' in symbol_data.columns and pd.notna(latest_row['asks']):
-            ask_levels, ask_quantities = parse_orderbook_levels(latest_row['asks'])
-        
+
         results[symbol] = {
+            'df': sdf,
             'volatility_metrics': vol_metrics,
             'price_stats': {
                 'min_price': prices.min(),
                 'max_price': prices.max(),
                 'mean_price': prices.mean(),
-                'latest_price': prices.iloc[-1],  # Last snapshot price
-                'price_range_pct': ((prices.max() - prices.min()) / prices.mean()) * 100
-            },
-            'orderbook_levels': {
-                'bid_levels': bid_levels,
-                'bid_quantities': bid_quantities,
-                'ask_levels': ask_levels,
-                'ask_quantities': ask_quantities
+                'latest_price': prices.iloc[-1],
+                'price_range_pct': ((prices.max() - prices.min()) / prices.mean()) * 100 if prices.mean() else 0.0,
             },
             'data_quality': {
                 'total_observations': len(prices),
                 'missing_values': prices.isna().sum(),
-                'time_span_hours': (prices.index[-1] - prices.index[0]).total_seconds() / 3600 if hasattr(prices.index, 'total_seconds') else None
+                'time_span_hours': float((prices.index[-1] - prices.index[0]).total_seconds() / 3600.0) if len(prices) > 1 else 0.0
             }
         }
-    
+
     return results
 
+# ----------------------------------------------------------------------------
+# Percentile-by-level builder
+# ----------------------------------------------------------------------------
 
-def create_excel_volatility_tables(results: Dict, output_filename: str = "volatility_analysis.xlsx") -> None:
+def _collect_levels_for_symbol(symbol_df: pd.DataFrame, side: str) -> Dict[int, Dict[str, list]]:
     """
-    Create Excel file with four consolidated tables:
-    1. Volatility Analysis (% values without % symbol)
-    2. Buy Target Prices
-    3. Sell Target Prices
-    4. Orderbook Levels Analysis - Bid and Ask tables using actual orderbook prices
-    
-    Table 4 has 5 columns per asset: % Difference, Quantity, USD Value, Accumulated Qty, Accumulated USD
-    
-    Args:
-        results: Results from analyze_csv_volatility()
-        output_filename: Name of the Excel file to create
+    Build a dict: level_index -> {'pct_diff': [...], 'qty': [...], 'usd': [...]}
+    across all snapshots for one side ('bids' or 'asks').
     """
-    # Create workbook and worksheet
+    out: Dict[int, Dict[str, list]] = {}
+    for _, row in symbol_df.iterrows():
+        base_price = float(row['base_price'])
+        if side not in row or pd.isna(row[side]):
+            continue
+        try:
+            levels = parse_orderbook_blob(row[side])
+        except Exception:
+            continue
+        for i, lvl in enumerate(levels, start=1):  # 1-indexed levels
+            try:
+                px = float(lvl['px'])
+                sz = float(lvl['sz'])
+            except Exception:
+                continue
+            pct_diff = (px / base_price - 1.0) * 100.0
+            usd = px * sz
+            bucket = out.setdefault(i, {'pct_diff': [], 'qty': [], 'usd': []})
+            bucket['pct_diff'].append(pct_diff)
+            bucket['qty'].append(sz)
+            bucket['usd'].append(usd)
+    return out
+
+def _percentile(series: List[float], q: float) -> float:
+    if not series:
+        return float('nan')
+    return float(pd.Series(series).quantile(q))
+
+def build_percentile_depth(results: Dict, q: float = PERC_Q) -> pd.DataFrame:
+    """
+    For each symbol and side, compute pXX depth table per level, across all snapshots.
+    Returns a tidy DataFrame ready to write to CSV and to feed the Excel builder.
+    """
+    rows = []
+    for symbol, blob in results.items():
+        sdf = blob['df']
+        for side in ('bids', 'asks'):
+            buckets = _collect_levels_for_symbol(sdf, side)
+            acc_qty = 0.0
+            acc_usd = 0.0
+            for lvl in sorted(buckets.keys()):
+                b = buckets[lvl]
+                pct_p = _percentile(b['pct_diff'], q)
+                qty_p = _percentile(b['qty'], q)
+                usd_p = _percentile(b['usd'], q)
+                if not np.isnan(qty_p):
+                    acc_qty += qty_p
+                if not np.isnan(usd_p):
+                    acc_usd += usd_p
+                rows.append({
+                    'symbol': symbol,
+                    'side': 'bid' if side == 'bids' else 'ask',
+                    'level': lvl,
+                    'pct_diff': round(pct_p, 3) if not np.isnan(pct_p) else np.nan,
+                    'qty': round(qty_p, 6) if not np.isnan(qty_p) else np.nan,
+                    'usd': round(usd_p, 2) if not np.isnan(usd_p) else np.nan,
+                    'acc_qty': round(acc_qty, 6) if not np.isnan(acc_qty) else np.nan,
+                    'acc_usd': round(acc_usd, 2) if not np.isnan(acc_usd) else np.nan,
+                    'obs_count': len(b['qty'])
+                })
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df.sort_values(['symbol', 'side', 'level']).reset_index(drop=True)
+    return df
+
+def save_percentile_depth_csv(results: Dict, output_csv: str = CSV_PCT_FILENAME, q: float = PERC_Q) -> Path:
+    df = build_percentile_depth(results, q=q)
+    out_path = Path(output_csv)
+    df.rename(columns={
+        'pct_diff': f'pct_diff_p{int(q*100):02d}',
+        'qty':      f'qty_p{int(q*100):02d}',
+        'usd':      f'usd_p{int(q*100):02d}',
+        'acc_qty':  f'acc_qty_p{int(q*100):02d}',
+        'acc_usd':  f'acc_usd_p{int(q*100):02d}',
+    }).to_csv(out_path, index=False)
+    return out_path
+
+# ----------------------------------------------------------------------------
+# Excel builder (Table 4 uses percentile data)
+# ----------------------------------------------------------------------------
+
+def _fmt_price(p: float) -> str:
+    if p is None or (isinstance(p, float) and np.isnan(p)): return "N/A"
+    if p >= 1000: return f"{p:,.0f}"
+    if p >= 1:    return f"{p:.2f}"
+    return f"{p:.4f}"
+
+def create_excel_tables(results: Dict, pct_df: pd.DataFrame, output_filename: str = EXCEL_FILENAME, q: float = PERC_Q) -> None:
     workbook = openpyxl.Workbook()
-    worksheet = workbook.active
-    worksheet.title = "Trading Analysis"
-    
-    # Define styles
+    ws = workbook.active
+    ws.title = "Trading Analysis"
+
     header_font = Font(bold=True, size=12, color="FFFFFF")
     header_fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
-    table_title_font = Font(bold=True, size=14, color="000000")
-    cell_alignment = Alignment(horizontal="center", vertical="center")
-    positive_fill = PatternFill(start_color="E8F5E8", end_color="E8F5E8", fill_type="solid")  # Light green
-    negative_fill = PatternFill(start_color="FFF2F2", end_color="FFF2F2", fill_type="solid")  # Light red
-    
-    # Get symbols and time periods
+    title_font  = Font(bold=True, size=14, color="000000")
+    center      = Alignment(horizontal="center", vertical="center")
+    pos_fill    = PatternFill(start_color="E8F5E8", end_color="E8F5E8", fill_type="solid")
+    neg_fill    = PatternFill(start_color="FFF2F2", end_color="FFF2F2", fill_type="solid")
+
     symbols = list(results.keys())
-    time_periods = [3, 5, 10, 30, 60, 90, 1440, 525600]  # Added 1 day (1440 min) and 1 year (525600 min)
     time_labels = ["3min", "5min", "10min", "30min", "60min", "90min", "1day", "1year"]
-    vol_keys = ['3min_vol', '5min_vol', '10min_vol', '30min_vol', '60min_vol', '90min_vol', '1day_vol', '1year_vol']
-    
-    current_row = 1
-    
-    # Add note about percentages at the top
-    worksheet.cell(row=current_row, column=1, value="NOTE: All percentage values in tables below are numbers without % symbol for easier Excel editing")
-    worksheet.cell(row=current_row, column=1).font = Font(italic=True, size=10, color="666666")
-    current_row += 2
-    
-    # TABLE 1: Volatility Analysis (Delta Percentages)
-    worksheet.cell(row=current_row, column=1, value="1. Volatility Analysis - Delta Percentages")
-    worksheet.cell(row=current_row, column=1).font = table_title_font
-    current_row += 2
-    
-    # Headers
-    worksheet.cell(row=current_row, column=1, value="Minutes")
-    worksheet.cell(row=current_row, column=1).font = header_font
-    worksheet.cell(row=current_row, column=1).fill = header_fill
-    worksheet.cell(row=current_row, column=1).alignment = cell_alignment
-    
-    for col_idx, symbol in enumerate(symbols, start=2):
-        worksheet.cell(row=current_row, column=col_idx, value=f"{symbol} (% values)")
-        worksheet.cell(row=current_row, column=col_idx).font = header_font
-        worksheet.cell(row=current_row, column=col_idx).fill = header_fill
-        worksheet.cell(row=current_row, column=col_idx).alignment = cell_alignment
-    
-    current_row += 1
-    
-    # Data rows for volatility
-    for row_idx, (minutes, time_label, vol_key) in enumerate(zip(time_periods, time_labels, vol_keys)):
-        if time_label == "1day":
-            display_label = "1 day"
-        elif time_label == "1year":
-            display_label = "1 year"
-        else:
-            display_label = str(minutes)
-            
-        worksheet.cell(row=current_row, column=1, value=display_label)
-        worksheet.cell(row=current_row, column=1).alignment = cell_alignment
-        worksheet.cell(row=current_row, column=1).font = Font(bold=True)
-        
-        for col_idx, symbol in enumerate(symbols, start=2):
-            volatility = results[symbol]['volatility_metrics'][vol_key]
-            worksheet.cell(row=current_row, column=col_idx, value=round(volatility*100, 3))
-            worksheet.cell(row=current_row, column=col_idx).alignment = cell_alignment
-        
-        current_row += 1
-    
-    current_row += 2
-    
-    # TABLE 2: Buy Target Prices
-    worksheet.cell(row=current_row, column=1, value="2. Buy Target Prices - Base Price + Slippage")
-    worksheet.cell(row=current_row, column=1).font = table_title_font
-    current_row += 2
-    
-    # Headers
-    worksheet.cell(row=current_row, column=1, value="Minutes")
-    worksheet.cell(row=current_row, column=1).font = header_font
-    worksheet.cell(row=current_row, column=1).fill = header_fill
-    worksheet.cell(row=current_row, column=1).alignment = cell_alignment
-    
-    for col_idx, symbol in enumerate(symbols, start=2):
-        base_price = results[symbol]['price_stats']['latest_price']
-        
-        # Format base price for header
-        if base_price >= 1000:
-            base_price_str = f"{base_price:,.0f}"
-        elif base_price >= 1:
-            base_price_str = f"{base_price:.2f}"
-        else:
-            base_price_str = f"{base_price:.4f}"
-            
-        worksheet.cell(row=current_row, column=col_idx, value=f"{symbol} (${base_price_str})")
-        worksheet.cell(row=current_row, column=col_idx).font = header_font
-        worksheet.cell(row=current_row, column=col_idx).fill = header_fill
-        worksheet.cell(row=current_row, column=col_idx).alignment = cell_alignment
-    
-    current_row += 1
-    
-    # Data rows for buy prices
-    for row_idx, (minutes, time_label, vol_key) in enumerate(zip(time_periods, time_labels, vol_keys)):
-        if time_label == "1day":
-            display_label = "1 day"
-        elif time_label == "1year":
-            display_label = "1 year"
-        else:
-            display_label = str(minutes)
-            
-        worksheet.cell(row=current_row, column=1, value=display_label)
-        worksheet.cell(row=current_row, column=1).alignment = cell_alignment
-        worksheet.cell(row=current_row, column=1).font = Font(bold=True)
-        
-        for col_idx, symbol in enumerate(symbols, start=2):
-            base_price = results[symbol]['price_stats']['latest_price']
-            volatility = results[symbol]['volatility_metrics'][vol_key]
-            buy_price = base_price + (volatility * base_price)
-            
-            # Format based on price magnitude
-            if buy_price >= 1000:
-                price_str = f"{buy_price:,.0f}"
-            elif buy_price >= 1:
-                price_str = f"{buy_price:.2f}"
+    vol_keys    = ['3min_vol','5min_vol','10min_vol','30min_vol','60min_vol','90min_vol','1day_vol','1year_vol']
+
+    row = 1
+    ws.cell(row=row, column=1, value="NOTE: All percentage values in tables below are numbers without % symbol for easier Excel editing").font = Font(italic=True, size=10, color="666666")
+    row += 2
+
+    # TABLE 1: Volatility Analysis
+    ws.cell(row=row, column=1, value="1. Volatility Analysis - Delta Percentages").font = title_font
+    row += 2
+
+    ws.cell(row=row, column=1, value="Minutes").font = header_font
+    ws.cell(row=row, column=1).fill = header_fill
+    ws.cell(row=row, column=1).alignment = center
+
+    for c, sym in enumerate(symbols, start=2):
+        ws.cell(row=row, column=c, value=f"{sym} (% values)").font = header_font
+        ws.cell(row=row, column=c).fill = header_fill
+        ws.cell(row=row, column=c).alignment = center
+    row += 1
+
+    for tl, vk in zip(time_labels, vol_keys):
+        label = "1 day" if tl=="1day" else "1 year" if tl=="1year" else tl
+        ws.cell(row=row, column=1, value=label).alignment = center
+        ws.cell(row=row, column=1).font = Font(bold=True)
+        for c, sym in enumerate(symbols, start=2):
+            v = results[sym]['volatility_metrics'][vk]
+            ws.cell(row=row, column=c, value=round(v*100, 3)).alignment = center
+        row += 1
+
+    row += 2
+
+    # TABLE 2: Buy target prices
+    ws.cell(row=row, column=1, value="2. Buy Target Prices - Base Price + Slippage").font = title_font
+    row += 2
+
+    ws.cell(row=row, column=1, value="Minutes").font = header_font
+    ws.cell(row=row, column=1).fill = header_fill
+    ws.cell(row=row, column=1).alignment = center
+
+    for c, sym in enumerate(symbols, start=2):
+        bp = results[sym]['price_stats']['latest_price']
+        ws.cell(row=row, column=c, value=f"{sym} ($ {_fmt_price(bp)})").font = header_font
+        ws.cell(row=row, column=c).fill = header_fill
+        ws.cell(row=row, column=c).alignment = center
+    row += 1
+
+    for tl, vk in zip(time_labels, vol_keys):
+        label = "1 day" if tl=="1day" else "1 year" if tl=="1year" else tl
+        ws.cell(row=row, column=1, value=label).alignment = center
+        ws.cell(row=row, column=1).font = Font(bold=True)
+        for c, sym in enumerate(symbols, start=2):
+            base_price = results[sym]['price_stats']['latest_price']
+            vol = results[sym]['volatility_metrics'][vk]
+            price = base_price + (vol * base_price)
+            ws.cell(row=row, column=c, value=_fmt_price(price)).alignment = center
+        row += 1
+
+    row += 2
+
+    # TABLE 3: Sell target prices
+    ws.cell(row=row, column=1, value="3. Sell Target Prices - Base Price - Slippage").font = title_font
+    row += 2
+
+    ws.cell(row=row, column=1, value="Minutes").font = header_font
+    ws.cell(row=row, column=1).fill = header_fill
+    ws.cell(row=row, column=1).alignment = center
+
+    for c, sym in enumerate(symbols, start=2):
+        mean_price = results[sym]['price_stats']['mean_price']
+        ws.cell(row=row, column=c, value=f"{sym} ($ {_fmt_price(mean_price)})").font = header_font
+        ws.cell(row=row, column=c).fill = header_fill
+        ws.cell(row=row, column=c).alignment = center
+    row += 1
+
+    for tl, vk in zip(time_labels, vol_keys):
+        label = "1 day" if tl=="1day" else "1 year" if tl=="1year" else tl
+        ws.cell(row=row, column=1, value=label).alignment = center
+        ws.cell(row=row, column=1).font = Font(bold=True)
+        for c, sym in enumerate(symbols, start=2):
+            base_price = results[sym]['price_stats']['latest_price']
+            vol = results[sym]['volatility_metrics'][vk]
+            price = base_price - (vol * base_price)
+            ws.cell(row=row, column=c, value=_fmt_price(price)).alignment = center
+        row += 1
+
+    row += 2
+
+    # TABLE 4: Orderbook Levels Percentile Tables
+    p_label = f"p{int(q*100):02d}"
+    ws.cell(row=row, column=1, value=f"4. Orderbook Levels Analysis ({p_label}) - % Difference from Base Price (per level, across snapshots)").font = title_font
+    row += 2
+
+    # ----- BID TABLE -----
+    ws.cell(row=row, column=1, value="BID LEVELS (% Below Base Price)").font = Font(bold=True, color="008000")
+    row += 1
+
+    ws.cell(row=row, column=1, value="Level").font = header_font
+    ws.cell(row=row, column=1).fill = header_fill
+    ws.cell(row=row, column=1).alignment = center
+
+    col = 2
+    for sym in symbols:
+        for hdr in [f"{sym} %", f"{sym} Qty", f"{sym} USD", f"{sym} Acc Qty", f"{sym} Acc USD"]:
+            ws.cell(row=row, column=col, value=hdr).font = header_font
+            ws.cell(row=row, column=col).fill = header_fill
+            ws.cell(row=row, column=col).alignment = center
+            col += 1
+    row += 1
+
+    # Compute max bid level across symbols from percentile DF
+    max_bid_level = 0
+    for sym in symbols:
+        r = pct_df[(pct_df['symbol']==sym) & (pct_df['side']=='bid')]['level']
+        if not r.empty:
+            max_bid_level = max(max_bid_level, int(r.max()))
+
+    for lvl in range(1, max_bid_level+1):
+        ws.cell(row=row, column=1, value=lvl).alignment = center
+        ws.cell(row=row, column=1).font = Font(bold=True)
+        col = 2
+        for sym in symbols:
+            r = pct_df[(pct_df['symbol']==sym) & (pct_df['side']=='bid') & (pct_df['level']==lvl)]
+            if len(r)==1:
+                pct, qty, usd, accq, accusd = r.iloc[0][['pct_diff','qty','usd','acc_qty','acc_usd']]
+                cells = [pct, qty, usd, accq, accusd]
+                fills = [pos_fill]*5
             else:
-                price_str = f"{buy_price:.4f}"
-                
-            worksheet.cell(row=current_row, column=col_idx, value=price_str)
-            worksheet.cell(row=current_row, column=col_idx).alignment = cell_alignment
-        
-        current_row += 1
-    
-    current_row += 2
-    
-    # TABLE 3: Sell Target Prices
-    worksheet.cell(row=current_row, column=1, value="3. Sell Target Prices - Base Price - Slippage")
-    worksheet.cell(row=current_row, column=1).font = table_title_font
-    current_row += 2
-    
-    # Headers
-    worksheet.cell(row=current_row, column=1, value="Minutes")
-    worksheet.cell(row=current_row, column=1).font = header_font
-    worksheet.cell(row=current_row, column=1).fill = header_fill
-    worksheet.cell(row=current_row, column=1).alignment = cell_alignment
-    
-    for col_idx, symbol in enumerate(symbols, start=2):
-        base_price = results[symbol]['price_stats']['mean_price']
-        
-        # Format base price for header
-        if base_price >= 1000:
-            base_price_str = f"{base_price:,.0f}"
-        elif base_price >= 1:
-            base_price_str = f"{base_price:.2f}"
-        else:
-            base_price_str = f"{base_price:.4f}"
-            
-        worksheet.cell(row=current_row, column=col_idx, value=f"{symbol} (${base_price_str})")
-        worksheet.cell(row=current_row, column=col_idx).font = header_font
-        worksheet.cell(row=current_row, column=col_idx).fill = header_fill
-        worksheet.cell(row=current_row, column=col_idx).alignment = cell_alignment
-    
-    current_row += 1
-    
-    # Data rows for sell prices
-    for row_idx, (minutes, time_label, vol_key) in enumerate(zip(time_periods, time_labels, vol_keys)):
-        if time_label == "1day":
-            display_label = "1 day"
-        elif time_label == "1year":
-            display_label = "1 year"
-        else:
-            display_label = str(minutes)
-            
-        worksheet.cell(row=current_row, column=1, value=display_label)
-        worksheet.cell(row=current_row, column=1).alignment = cell_alignment
-        worksheet.cell(row=current_row, column=1).font = Font(bold=True)
-        
-        for col_idx, symbol in enumerate(symbols, start=2):
-            base_price = results[symbol]['price_stats']['latest_price']
-            volatility = results[symbol]['volatility_metrics'][vol_key]
-            sell_price = base_price - (volatility * base_price)
-            
-            # Format based on price magnitude
-            if sell_price >= 1000:
-                price_str = f"{sell_price:,.0f}"
-            elif sell_price >= 1:
-                price_str = f"{sell_price:.2f}"
+                cells = ["N/A"]*5
+                fills = [pos_fill]*5
+            for val, f in zip(cells, fills):
+                if isinstance(val, (int, float)) and not (isinstance(val, float) and np.isnan(val)):
+                    disp = round(val, 3) if isinstance(val, float) else val
+                else:
+                    disp = "N/A"
+                c = ws.cell(row=row, column=col, value=disp)
+                c.alignment = center
+                c.fill = f
+                col += 1
+        row += 1
+
+    row += 1
+
+    # ----- ASK TABLE -----
+    ws.cell(row=row, column=1, value="ASK LEVELS (% Above Base Price)").font = Font(bold=True, color="CC0000")
+    row += 1
+
+    ws.cell(row=row, column=1, value="Level").font = header_font
+    ws.cell(row=row, column=1).fill = header_fill
+    ws.cell(row=row, column=1).alignment = center
+
+    col = 2
+    for sym in symbols:
+        for hdr in [f"{sym} %", f"{sym} Qty", f"{sym} USD", f"{sym} Acc Qty", f"{sym} Acc USD"]:
+            ws.cell(row=row, column=col, value=hdr).font = header_font
+            ws.cell(row=row, column=col).fill = header_fill
+            ws.cell(row=row, column=col).alignment = center
+            col += 1
+    row += 1
+
+    max_ask_level = 0
+    for sym in symbols:
+        r = pct_df[(pct_df['symbol']==sym) & (pct_df['side']=='ask')]['level']
+        if not r.empty:
+            max_ask_level = max(max_ask_level, int(r.max()))
+
+    for lvl in range(1, max_ask_level+1):
+        ws.cell(row=row, column=1, value=lvl).alignment = center
+        ws.cell(row=row, column=1).font = Font(bold=True)
+        col = 2
+        for sym in symbols:
+            r = pct_df[(pct_df['symbol']==sym) & (pct_df['side']=='ask') & (pct_df['level']==lvl)]
+            if len(r)==1:
+                pct, qty, usd, accq, accusd = r.iloc[0][['pct_diff','qty','usd','acc_qty','acc_usd']]
+                cells = [pct, qty, usd, accq, accusd]
+                fills = [neg_fill]*5
             else:
-                price_str = f"{sell_price:.4f}"
-                
-            worksheet.cell(row=current_row, column=col_idx, value=price_str)
-            worksheet.cell(row=current_row, column=col_idx).alignment = cell_alignment
-        
-        current_row += 1
-    
-    current_row += 2
-    
-    # TABLE 4: Levels Analysis - Bid and Ask Tables
-    worksheet.cell(row=current_row, column=1, value="4. Orderbook Levels Analysis - Percentage Difference from Base Price")
-    worksheet.cell(row=current_row, column=1).font = table_title_font
-    current_row += 2
-    
-    # BID LEVELS TABLE
-    worksheet.cell(row=current_row, column=1, value="BID LEVELS (% Below Base Price)")
-    worksheet.cell(row=current_row, column=1).font = Font(bold=True, color="008000")  # Green
-    current_row += 1
-    
-    # Headers for bid levels - 5 columns per symbol
-    worksheet.cell(row=current_row, column=1, value="Level")
-    worksheet.cell(row=current_row, column=1).font = header_font
-    worksheet.cell(row=current_row, column=1).fill = header_fill
-    worksheet.cell(row=current_row, column=1).alignment = cell_alignment
-    
-    col_idx = 2
-    for symbol in symbols:
-        # Column 1: Percentage
-        worksheet.cell(row=current_row, column=col_idx, value=f"{symbol} %")
-        worksheet.cell(row=current_row, column=col_idx).font = header_font
-        worksheet.cell(row=current_row, column=col_idx).fill = header_fill
-        worksheet.cell(row=current_row, column=col_idx).alignment = cell_alignment
-        
-        # Column 2: Quantity
-        worksheet.cell(row=current_row, column=col_idx + 1, value=f"{symbol} Qty")
-        worksheet.cell(row=current_row, column=col_idx + 1).font = header_font
-        worksheet.cell(row=current_row, column=col_idx + 1).fill = header_fill
-        worksheet.cell(row=current_row, column=col_idx + 1).alignment = cell_alignment
-        
-        # Column 3: USD Value
-        worksheet.cell(row=current_row, column=col_idx + 2, value=f"{symbol} USD")
-        worksheet.cell(row=current_row, column=col_idx + 2).font = header_font
-        worksheet.cell(row=current_row, column=col_idx + 2).fill = header_fill
-        worksheet.cell(row=current_row, column=col_idx + 2).alignment = cell_alignment
-        
-        # Column 4: Accumulated Quantity
-        worksheet.cell(row=current_row, column=col_idx + 3, value=f"{symbol} Acc Qty")
-        worksheet.cell(row=current_row, column=col_idx + 3).font = header_font
-        worksheet.cell(row=current_row, column=col_idx + 3).fill = header_fill
-        worksheet.cell(row=current_row, column=col_idx + 3).alignment = cell_alignment
-        
-        # Column 5: Accumulated USD
-        worksheet.cell(row=current_row, column=col_idx + 4, value=f"{symbol} Acc USD")
-        worksheet.cell(row=current_row, column=col_idx + 4).font = header_font
-        worksheet.cell(row=current_row, column=col_idx + 4).fill = header_fill
-        worksheet.cell(row=current_row, column=col_idx + 4).alignment = cell_alignment
-        
-        col_idx += 5  # Move to next symbol's columns
-    
-    current_row += 1
-    
-    # Data rows for bid levels - using actual orderbook bid prices (all levels)
-    max_bid_levels = max([len(results[symbol]['orderbook_levels']['bid_levels']) for symbol in symbols]) if symbols else 0
-    
-    # Initialize accumulators for each symbol
-    symbol_accumulators = {}
-    for symbol in symbols:
-        symbol_accumulators[symbol] = {'qty': 0.0, 'usd': 0.0}
-    
-    for level in range(1, max_bid_levels + 1):
-        worksheet.cell(row=current_row, column=1, value=level)
-        worksheet.cell(row=current_row, column=1).alignment = cell_alignment
-        worksheet.cell(row=current_row, column=1).font = Font(bold=True)
-        
-        col_idx = 2
-        for symbol in symbols:
-            base_price = results[symbol]['price_stats']['latest_price']
-            bid_levels = results[symbol]['orderbook_levels']['bid_levels']
-            bid_quantities = results[symbol]['orderbook_levels']['bid_quantities']
-            
-            if level <= len(bid_levels):
-                level_price = bid_levels[level - 1]  # level 1 = index 0
-                level_quantity = bid_quantities[level - 1]
-                usd_value = level_quantity * level_price
-                
-                # Update accumulators
-                symbol_accumulators[symbol]['qty'] += level_quantity
-                symbol_accumulators[symbol]['usd'] += usd_value
-                
-                # Column 1: Percentage difference
-                pct_diff = (level_price / base_price * 100) - 100
-                cell = worksheet.cell(row=current_row, column=col_idx, value=round(pct_diff, 3))
-                cell.alignment = cell_alignment
-                cell.fill = positive_fill
-                
-                # Column 2: Quantity in asset currency
-                cell = worksheet.cell(row=current_row, column=col_idx + 1, value=round(level_quantity, 6))
-                cell.alignment = cell_alignment
-                cell.fill = positive_fill
-                
-                # Column 3: USD value (quantity * price)
-                cell = worksheet.cell(row=current_row, column=col_idx + 2, value=round(usd_value, 2))
-                cell.alignment = cell_alignment
-                cell.fill = positive_fill
-                
-                # Column 4: Accumulated quantity
-                cell = worksheet.cell(row=current_row, column=col_idx + 3, value=round(symbol_accumulators[symbol]['qty'], 6))
-                cell.alignment = cell_alignment
-                cell.fill = positive_fill
-                
-                # Column 5: Accumulated USD
-                cell = worksheet.cell(row=current_row, column=col_idx + 4, value=round(symbol_accumulators[symbol]['usd'], 2))
-                cell.alignment = cell_alignment
-                cell.fill = positive_fill
-                
-            else:
-                # No data for this level - fill all 5 columns with N/A
-                for i in range(5):
-                    cell = worksheet.cell(row=current_row, column=col_idx + i, value="N/A")
-                    cell.alignment = cell_alignment
-            
-            col_idx += 5  # Move to next symbol's columns
-        
-        current_row += 1
-    
-    current_row += 1
-    
-    # ASK LEVELS TABLE
-    worksheet.cell(row=current_row, column=1, value="ASK LEVELS (% Above Base Price)")
-    worksheet.cell(row=current_row, column=1).font = Font(bold=True, color="CC0000")  # Red
-    current_row += 1
-    
-    # Headers for ask levels - 5 columns per symbol
-    worksheet.cell(row=current_row, column=1, value="Level")
-    worksheet.cell(row=current_row, column=1).font = header_font
-    worksheet.cell(row=current_row, column=1).fill = header_fill
-    worksheet.cell(row=current_row, column=1).alignment = cell_alignment
-    
-    col_idx = 2
-    for symbol in symbols:
-        # Column 1: Percentage
-        worksheet.cell(row=current_row, column=col_idx, value=f"{symbol} %")
-        worksheet.cell(row=current_row, column=col_idx).font = header_font
-        worksheet.cell(row=current_row, column=col_idx).fill = header_fill
-        worksheet.cell(row=current_row, column=col_idx).alignment = cell_alignment
-        
-        # Column 2: Quantity
-        worksheet.cell(row=current_row, column=col_idx + 1, value=f"{symbol} Qty")
-        worksheet.cell(row=current_row, column=col_idx + 1).font = header_font
-        worksheet.cell(row=current_row, column=col_idx + 1).fill = header_fill
-        worksheet.cell(row=current_row, column=col_idx + 1).alignment = cell_alignment
-        
-        # Column 3: USD Value
-        worksheet.cell(row=current_row, column=col_idx + 2, value=f"{symbol} USD")
-        worksheet.cell(row=current_row, column=col_idx + 2).font = header_font
-        worksheet.cell(row=current_row, column=col_idx + 2).fill = header_fill
-        worksheet.cell(row=current_row, column=col_idx + 2).alignment = cell_alignment
-        
-        # Column 4: Accumulated Quantity
-        worksheet.cell(row=current_row, column=col_idx + 3, value=f"{symbol} Acc Qty")
-        worksheet.cell(row=current_row, column=col_idx + 3).font = header_font
-        worksheet.cell(row=current_row, column=col_idx + 3).fill = header_fill
-        worksheet.cell(row=current_row, column=col_idx + 3).alignment = cell_alignment
-        
-        # Column 5: Accumulated USD
-        worksheet.cell(row=current_row, column=col_idx + 4, value=f"{symbol} Acc USD")
-        worksheet.cell(row=current_row, column=col_idx + 4).font = header_font
-        worksheet.cell(row=current_row, column=col_idx + 4).fill = header_fill
-        worksheet.cell(row=current_row, column=col_idx + 4).alignment = cell_alignment
-        
-        col_idx += 5  # Move to next symbol's columns
-    
-    current_row += 1
-    
-    # Data rows for ask levels - using actual orderbook ask prices (all levels)
-    max_ask_levels = max([len(results[symbol]['orderbook_levels']['ask_levels']) for symbol in symbols]) if symbols else 0
-    
-    # Reset accumulators for ask levels
-    symbol_accumulators = {}
-    for symbol in symbols:
-        symbol_accumulators[symbol] = {'qty': 0.0, 'usd': 0.0}
-    
-    for level in range(1, max_ask_levels + 1):
-        worksheet.cell(row=current_row, column=1, value=level)
-        worksheet.cell(row=current_row, column=1).alignment = cell_alignment
-        worksheet.cell(row=current_row, column=1).font = Font(bold=True)
-        
-        col_idx = 2
-        for symbol in symbols:
-            base_price = results[symbol]['price_stats']['latest_price']
-            ask_levels = results[symbol]['orderbook_levels']['ask_levels']
-            ask_quantities = results[symbol]['orderbook_levels']['ask_quantities']
-            
-            if level <= len(ask_levels):
-                level_price = ask_levels[level - 1]  # level 1 = index 0
-                level_quantity = ask_quantities[level - 1]
-                usd_value = level_quantity * level_price
-                
-                # Update accumulators
-                symbol_accumulators[symbol]['qty'] += level_quantity
-                symbol_accumulators[symbol]['usd'] += usd_value
-                
-                # Column 1: Percentage difference
-                pct_diff = (level_price / base_price * 100) - 100
-                cell = worksheet.cell(row=current_row, column=col_idx, value=round(pct_diff, 3))
-                cell.alignment = cell_alignment
-                cell.fill = negative_fill
-                
-                # Column 2: Quantity in asset currency
-                cell = worksheet.cell(row=current_row, column=col_idx + 1, value=round(level_quantity, 6))
-                cell.alignment = cell_alignment
-                cell.fill = negative_fill
-                
-                # Column 3: USD value (quantity * price)
-                cell = worksheet.cell(row=current_row, column=col_idx + 2, value=round(usd_value, 2))
-                cell.alignment = cell_alignment
-                cell.fill = negative_fill
-                
-                # Column 4: Accumulated quantity
-                cell = worksheet.cell(row=current_row, column=col_idx + 3, value=round(symbol_accumulators[symbol]['qty'], 6))
-                cell.alignment = cell_alignment
-                cell.fill = negative_fill
-                
-                # Column 5: Accumulated USD
-                cell = worksheet.cell(row=current_row, column=col_idx + 4, value=round(symbol_accumulators[symbol]['usd'], 2))
-                cell.alignment = cell_alignment
-                cell.fill = negative_fill
-                
-            else:
-                # No data for this level - fill all 5 columns with N/A
-                for i in range(5):
-                    cell = worksheet.cell(row=current_row, column=col_idx + i, value="N/A")
-                    cell.alignment = cell_alignment
-            
-            col_idx += 5  # Move to next symbol's columns
-        
-        current_row += 1
-    
-    # Adjust column widths
-    worksheet.column_dimensions['A'].width = 10
-    # For tables 1-3: normal width
-    for col_idx in range(2, len(symbols) + 2):
-        col_letter = get_column_letter(col_idx)
-        worksheet.column_dimensions[col_letter].width = 15
-    # For table 4: wider columns (5 columns per symbol)
-    total_table4_cols = len(symbols) * 5
-    for col_idx in range(2, total_table4_cols + 2):
-        col_letter = get_column_letter(col_idx)
-        worksheet.column_dimensions[col_letter].width = 12
-    
-    # Save the workbook
+                cells = ["N/A"]*5
+                fills = [neg_fill]*5
+            for val, f in zip(cells, fills):
+                if isinstance(val, (int, float)) and not (isinstance(val, float) and np.isnan(val)):
+                    disp = round(val, 3) if isinstance(val, float) else val
+                else:
+                    disp = "N/A"
+                c = ws.cell(row=row, column=col, value=disp)
+                c.alignment = center
+                c.fill = f
+                col += 1
+        row += 1
+
+    # Widths
+    ws.column_dimensions['A'].width = 10
+    # Table 1-3
+    base_cols = len(symbols)+1
+    for c in range(2, base_cols+1):
+        ws.column_dimensions[get_column_letter(c)].width = 15
+    # Table 4
+    total_cols = len(symbols)*5 + 1
+    for c in range(2, total_cols+1):
+        ws.column_dimensions[get_column_letter(c)].width = 12
+
     workbook.save(output_filename)
 
+# ----------------------------------------------------------------------------
+# CLI
+# ----------------------------------------------------------------------------
 
 def main():
-    """Main execution function."""
     if len(sys.argv) < 2:
-        print("Usage: python volatility_calculator.py <csv_file> [symbol1] [symbol2] [symbol3] ...")
-        print("Examples:")
-        print("  python volatility_calculator.py orderbook_data.csv                    # Analyze all symbols")
-        print("  python volatility_calculator.py orderbook_data.csv BTC               # Analyze one symbol")
-        print("  python volatility_calculator.py orderbook_data.csv BTC ETH SOL       # Analyze multiple symbols")
+        print("Usage: python volatility.py <csv_file> [symbol1] [symbol2] ...")
         sys.exit(1)
-    
+
     csv_path = sys.argv[1]
-    symbol_filters = sys.argv[2:] if len(sys.argv) > 2 else None  # Get all symbols after csv_path
-    
+    symbol_filters = sys.argv[2:] if len(sys.argv) > 2 else None
+
     if not Path(csv_path).exists():
         raise SystemExit(f"CSV file not found: {csv_path}")
-    
-    # Analyze volatility
-    results = analyze_csv_volatility(csv_path, symbol_filters)
-    
-    # Create Excel file with volatility tables
-    create_excel_volatility_tables(results)
 
+    # Analyze
+    results = analyze_csv(csv_path, symbol_filters)
+
+    # Build percentile depth (global across all snapshots)
+    pct_df = build_percentile_depth(results, q=PERC_Q)
+
+    # Save big CSV
+    out_csv = save_percentile_depth_csv(results, output_csv=CSV_PCT_FILENAME, q=PERC_Q)
+    print(f"Wrote percentile depth CSV -> {out_csv}")
+
+    # Excel workbook (uses percentile tables for Table 4)
+    create_excel_tables(results, pct_df, output_filename=EXCEL_FILENAME, q=PERC_Q)
+    print(f"Wrote Excel workbook -> {EXCEL_FILENAME}")
 
 if __name__ == "__main__":
     main()
