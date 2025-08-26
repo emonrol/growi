@@ -1,7 +1,13 @@
 import requests
 from typing import Dict, List, Tuple, Optional
+import json
+import sys
+import argparse
+from pathlib import Path
+import time
 
 INFO_URL = "https://api.hyperliquid.xyz/info"
+LEVERAGE_DATA_FILE = "leverage_data.json"
 
 class HLMetaError(Exception):
     pass
@@ -214,3 +220,203 @@ def get_leverage_info_safe(token: str, dex: str = "") -> Dict:
             'tiers': [],
             'tiers_formatted': []
         }
+
+def save_leverage_data(symbols: List[str], output_file: str = LEVERAGE_DATA_FILE, dex: str = "") -> None:
+    """
+    Fetch leverage data for multiple symbols and save to JSON file.
+    
+    Args:
+        symbols: List of symbols to fetch leverage data for
+        output_file: Output JSON filename
+        dex: Optional dex parameter for API
+    """
+    leverage_data = {
+        'timestamp': time.time(),
+        'symbols': {}
+    }
+    
+    print(f"Fetching leverage data for {len(symbols)} symbols...")
+    
+    for i, symbol in enumerate(symbols, 1):
+        print(f"[{i}/{len(symbols)}] Fetching {symbol}...")
+        try:
+            data = get_leverage_info_safe(symbol, dex=dex)
+            leverage_data['symbols'][symbol] = data
+            
+            if data['status'] == 'success':
+                print(f"  ✓ Success - {data['num_tiers']} tiers, max {data['max_leverage']}x")
+            elif data['status'] == 'partial_success':
+                print(f"  ⚠ Partial - fallback to {data['max_leverage']}x")
+            else:
+                print(f"  ✗ Error - {data.get('error', 'Unknown error')}")
+                
+        except Exception as e:
+            print(f"  ✗ Exception - {e}")
+            leverage_data['symbols'][symbol] = {
+                'status': 'error',
+                'token': symbol,
+                'error': str(e),
+                'max_leverage': 0,
+                'min_leverage': 0,
+                'num_tiers': 0,
+                'tiers': [],
+                'tiers_formatted': []
+            }
+    
+    # Save to file
+    try:
+        with open(output_file, 'w') as f:
+            json.dump(leverage_data, f, indent=2)
+        print(f"\n✓ Leverage data saved to: {output_file}")
+        print(f"  Timestamp: {time.ctime(leverage_data['timestamp'])}")
+        print(f"  Symbols: {len(leverage_data['symbols'])}")
+        
+        # Summary
+        success_count = sum(1 for data in leverage_data['symbols'].values() if data['status'] == 'success')
+        partial_count = sum(1 for data in leverage_data['symbols'].values() if data['status'] == 'partial_success')
+        error_count = sum(1 for data in leverage_data['symbols'].values() if data['status'] == 'error')
+        
+        print(f"  Results: {success_count} success, {partial_count} partial, {error_count} errors")
+        
+    except Exception as e:
+        raise SystemExit(f"Error saving leverage data: {e}")
+
+def load_leverage_data(input_file: str = LEVERAGE_DATA_FILE) -> Dict:
+    """
+    Load leverage data from JSON file.
+    
+    Args:
+        input_file: Input JSON filename
+        
+    Returns:
+        Dict containing leverage data
+    """
+    try:
+        with open(input_file, 'r') as f:
+            data = json.load(f)
+        
+        if 'timestamp' in data and 'symbols' in data:
+            return data
+        else:
+            raise ValueError("Invalid leverage data file format")
+            
+    except FileNotFoundError:
+        raise SystemExit(f"Leverage data file not found: {input_file}")
+    except json.JSONDecodeError as e:
+        raise SystemExit(f"Invalid JSON in leverage data file: {e}")
+    except Exception as e:
+        raise SystemExit(f"Error loading leverage data: {e}")
+
+def get_symbols_from_leverage_file(input_file: str = LEVERAGE_DATA_FILE) -> List[str]:
+    """
+    Get list of symbols available in leverage data file.
+    
+    Args:
+        input_file: Input JSON filename
+        
+    Returns:
+        List of symbol names
+    """
+    try:
+        data = load_leverage_data(input_file)
+        return list(data['symbols'].keys())
+    except Exception as e:
+        print(f"Warning: Could not load symbols from leverage file: {e}")
+        return []
+
+def get_leverage_info_from_file(symbol: str, input_file: str = LEVERAGE_DATA_FILE) -> Dict:
+    """
+    Get leverage info for a specific symbol from file.
+    
+    Args:
+        symbol: Symbol to get leverage info for
+        input_file: Input JSON filename
+        
+    Returns:
+        Leverage info dict
+    """
+    try:
+        data = load_leverage_data(input_file)
+        
+        if symbol in data['symbols']:
+            return data['symbols'][symbol]
+        else:
+            return {
+                'status': 'error',
+                'token': symbol,
+                'error': f'Symbol {symbol} not found in leverage data file',
+                'max_leverage': 0,
+                'min_leverage': 0,
+                'num_tiers': 0,
+                'tiers': [],
+                'tiers_formatted': []
+            }
+    except Exception as e:
+        return {
+            'status': 'error',
+            'token': symbol,
+            'error': f'Could not load from leverage data file: {e}',
+            'max_leverage': 0,
+            'min_leverage': 0,
+            'num_tiers': 0,
+            'tiers': [],
+            'tiers_formatted': []
+        }
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(description="Fetch and save leverage data for crypto symbols")
+    parser.add_argument('symbols', nargs='*', 
+                       help='Symbols to fetch leverage data for (if none provided, shows available symbols)')
+    parser.add_argument('--output', '-o', default=LEVERAGE_DATA_FILE,
+                       help=f'Output JSON file (default: {LEVERAGE_DATA_FILE})')
+    parser.add_argument('--dex', default="",
+                       help='Optional DEX parameter for API')
+    parser.add_argument('--list', '-l', action='store_true',
+                       help='List symbols available in existing leverage data file')
+    
+    return parser.parse_args()
+
+def main():
+    args = parse_arguments()
+    
+    if args.list:
+        # List symbols in existing file
+        if Path(args.output).exists():
+            try:
+                data = load_leverage_data(args.output)
+                symbols = list(data['symbols'].keys())
+                timestamp = time.ctime(data['timestamp'])
+                
+                print(f"Leverage data file: {args.output}")
+                print(f"Last updated: {timestamp}")
+                print(f"Symbols ({len(symbols)}):")
+                for symbol in sorted(symbols):
+                    status = data['symbols'][symbol]['status']
+                    if status == 'success':
+                        max_lev = data['symbols'][symbol]['max_leverage']
+                        print(f"  {symbol} - ✓ {max_lev}x")
+                    elif status == 'partial_success':
+                        max_lev = data['symbols'][symbol]['max_leverage']
+                        print(f"  {symbol} - ⚠ {max_lev}x (fallback)")
+                    else:
+                        print(f"  {symbol} - ✗ Error")
+                        
+            except Exception as e:
+                print(f"Error reading leverage data file: {e}")
+        else:
+            print(f"No leverage data file found: {args.output}")
+        return
+    
+    if not args.symbols:
+        # No symbols provided - show usage
+        print("No symbols provided. Usage examples:")
+        print(f"  python {sys.argv[0]} BTC ETH SOL")
+        print(f"  python {sys.argv[0]} --list")
+        print(f"  python {sys.argv[0]} --help")
+        return
+    
+    # Fetch and save leverage data
+    save_leverage_data(args.symbols, args.output, args.dex)
+
+if __name__ == "__main__":
+    main()
