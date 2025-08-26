@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Volatility Calculator + Orderbook Percentile Depth Tables + Leverage Information
+Volatility Calculator + Orderbook Percentile Depth Tables + Leverage Information + Leverage vs USD Chart
 
 Analyzes 5-minute crypto snapshots to compute:
 1) Volatility metrics (scaled from 5-min returns)
 2) Leverage information from Hyperliquid API
 3) Percentile orderbook depth tables using absolute spread distances
+4) Column chart: Effective Leverage vs Median USD Quantity
 
 Usage:
 python volatility.py data.csv                              # Default percentiles [1, 10, 25, 50]
 python volatility.py data.csv BTC ETH                      # Subset of symbols
 python volatility.py data.csv --percentiles 5 25 75       # Custom percentiles
 python volatility.py data.csv --sep ";"                   # Custom CSV separator
+python volatility.py data.csv --chart-level 1             # Use specific orderbook level for chart (default: 1)
 """
 
 import sys
@@ -24,6 +26,8 @@ import pandas as pd
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 sys.path.append("/home/eric/Documents/growi")
 from orderbook_utils import parse_orderbook_blob, validate_required_columns, REQUIRED_CSV_COLUMNS, _normalize_number
@@ -31,6 +35,7 @@ from API import get_leverage_info_safe, HLMetaError
 
 DEFAULT_PERCENTILES = [1, 10, 25, 50]
 EXCEL_FILENAME = "volatility_analysis.xlsx"
+CHART_FILENAME = "leverage_vs_usd_chart.png"
 
 def calculate_log_returns(prices: pd.Series) -> pd.Series:
     prices = prices[prices > 0]
@@ -53,6 +58,205 @@ def calculate_volatility_metrics(log_returns: pd.Series) -> Dict[str, float]:
 
 def fetch_leverage_info(symbol: str) -> Dict:
     return get_leverage_info_safe(symbol)
+
+def get_effective_leverage_for_usd_amount(usd_amount: float, leverage_tiers: List[Tuple[float, float, int]]) -> int:
+    """
+    Given a USD amount and leverage tiers, return the maximum leverage available for that amount.
+    
+    leverage_tiers format: [(lower_bound, upper_bound, leverage), ...]
+    Example: [(0.0, 20000000.0, 10), (20000000.0, inf, 5)]
+    """
+    if not leverage_tiers:
+        return 0
+    
+    for lower_bound, upper_bound, leverage in leverage_tiers:
+        if lower_bound <= usd_amount < upper_bound:
+            return leverage
+    
+    # If no tier matches, return the leverage of the highest tier
+    return leverage_tiers[-1][2] if leverage_tiers else 0
+
+def extract_median_usd_from_p50(results: Dict, percentiles: List[int], orderbook_level: int = 1) -> Dict[str, Dict]:
+    """
+    Extract median USD quantities from p50 percentile data for each symbol.
+    
+    Args:
+        results: Analysis results
+        percentiles: List of percentiles (must include 50)
+        orderbook_level: Which orderbook level to use (1 = best bid/ask, 2 = second level, etc.)
+    
+    Returns:
+        Dict with symbol -> {
+            'bid_usd': float,
+            'ask_usd': float, 
+            'avg_usd': float,
+            'effective_leverage_bid': int,
+            'effective_leverage_ask': int,
+            'effective_leverage_avg': int
+        }
+    """
+    if 50 not in percentiles:
+        raise ValueError("Percentile 50 must be included to extract median USD data")
+    
+    # Build percentile data
+    percentile_dfs = build_percentile_depth(results, percentiles)
+    p50_df = percentile_dfs[50]
+    
+    leverage_usd_data = {}
+    
+    for symbol in results.keys():
+        leverage_info = results[symbol]['leverage_info']
+        leverage_tiers = leverage_info.get('tiers', [])
+        
+        # Get bid and ask USD for the specified level
+        bid_data = p50_df[(p50_df['symbol'] == symbol) & 
+                         (p50_df['side'] == 'bid') & 
+                         (p50_df['level'] == orderbook_level)]
+        
+        ask_data = p50_df[(p50_df['symbol'] == symbol) & 
+                         (p50_df['side'] == 'ask') & 
+                         (p50_df['level'] == orderbook_level)]
+        
+        bid_usd = bid_data['usd'].iloc[0] if len(bid_data) > 0 and not pd.isna(bid_data['usd'].iloc[0]) else 0.0
+        ask_usd = ask_data['usd'].iloc[0] if len(ask_data) > 0 and not pd.isna(ask_data['usd'].iloc[0]) else 0.0
+        
+        # Calculate average
+        avg_usd = (bid_usd + ask_usd) / 2 if (bid_usd > 0 or ask_usd > 0) else 0.0
+        
+        # Get effective leverage for each USD amount
+        effective_lev_bid = get_effective_leverage_for_usd_amount(bid_usd, leverage_tiers)
+        effective_lev_ask = get_effective_leverage_for_usd_amount(ask_usd, leverage_tiers)  
+        effective_lev_avg = get_effective_leverage_for_usd_amount(avg_usd, leverage_tiers)
+        
+        leverage_usd_data[symbol] = {
+            'bid_usd': bid_usd,
+            'ask_usd': ask_usd,
+            'avg_usd': avg_usd,
+            'effective_leverage_bid': effective_lev_bid,
+            'effective_leverage_ask': effective_lev_ask,
+            'effective_leverage_avg': effective_lev_avg
+        }
+    
+    return leverage_usd_data
+
+def create_leverage_vs_usd_chart(leverage_usd_data: Dict, output_filename: str = CHART_FILENAME, 
+                                 chart_type: str = 'avg') -> None:
+    """
+    Create a column chart: Leverage (X) vs USD Quantity (Y)
+    
+    Args:
+        leverage_usd_data: Data from extract_median_usd_from_p50
+        output_filename: Output chart filename
+        chart_type: 'bid', 'ask', or 'avg' to determine which data to use
+    """
+    # Prepare data
+    chart_data = []
+    
+    for symbol, data in leverage_usd_data.items():
+        if chart_type == 'bid':
+            leverage = data['effective_leverage_bid']
+            usd_amount = data['bid_usd']
+        elif chart_type == 'ask':
+            leverage = data['effective_leverage_ask'] 
+            usd_amount = data['ask_usd']
+        else:  # avg
+            leverage = data['effective_leverage_avg']
+            usd_amount = data['avg_usd']
+        
+        if leverage > 0 and usd_amount > 0:
+            chart_data.append({
+                'symbol': symbol,
+                'leverage': leverage,
+                'usd_amount': usd_amount
+            })
+    
+    if not chart_data:
+        print("Warning: No data available for leverage vs USD chart")
+        return
+    
+    # Convert to DataFrame
+    df = pd.DataFrame(chart_data)
+    
+    # Create the chart
+    plt.figure(figsize=(12, 8))
+    
+    # Group by leverage for better visualization
+    leverage_groups = df.groupby('leverage')
+    
+    # Create colors for each symbol
+    colors = plt.cm.Set3(np.linspace(0, 1, len(df)))
+    
+    bar_width = 0.8
+    positions = []
+    labels = []
+    values = []
+    symbol_labels = []
+    
+    for i, (leverage, group) in enumerate(leverage_groups):
+        symbols = group['symbol'].tolist()
+        usd_amounts = group['usd_amount'].tolist()
+        
+        if len(symbols) == 1:
+            # Single bar
+            positions.append(leverage)
+            values.append(usd_amounts[0])
+            symbol_labels.append(symbols[0])
+        else:
+            # Multiple bars - group them
+            n_bars = len(symbols)
+            sub_width = bar_width / n_bars
+            for j, (symbol, usd_amount) in enumerate(zip(symbols, usd_amounts)):
+                print(usd_amount)
+                pos = leverage + (j - (n_bars-1)/2) * sub_width * 0.3
+                positions.append(pos)
+                values.append(usd_amount)
+                symbol_labels.append(symbol)
+    
+    # Calculate appropriate bar width based on maximum symbols per leverage level
+    max_symbols_per_leverage = df.groupby('leverage').size().max() if len(df) > 0 else 1
+    adjusted_bar_width = bar_width / max(1, max_symbols_per_leverage)
+    
+    # Create bars
+    bars = plt.bar(positions, values, width=adjusted_bar_width,
+                   color=colors[:len(positions)], alpha=0.8, edgecolor='black', linewidth=0.5)
+    
+    # Add symbol labels on bars
+    for bar, symbol in zip(bars, symbol_labels):
+        height = bar.get_height()
+        plt.text(bar.get_x() + bar.get_width()/2., height + height*0.01,
+                symbol, ha='center', va='bottom', fontweight='bold', fontsize=10)
+    
+    # Formatting
+    plt.xlabel('Effective Leverage (x)', fontsize=12, fontweight='bold')
+    plt.ylabel('Median USD Quantity (p50)', fontsize=12, fontweight='bold')
+    chart_type_label = chart_type.upper() if chart_type != 'avg' else 'AVERAGE'
+    plt.title(f'Effective Leverage vs Median USD Quantity ({chart_type_label})\nOrderbook Level 1 - Percentile 50', 
+              fontsize=14, fontweight='bold', pad=20)
+    
+    # Format Y-axis to show USD amounts nicely
+    ax = plt.gca()
+    ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'${x:,.0f}' if x >= 1000 else f'${x:.0f}'))
+    
+    # Set X-axis to show integer leverage values
+    leverage_values = sorted(df['leverage'].unique())
+    plt.xticks(leverage_values, [f'{int(lev)}x' for lev in leverage_values])
+    
+    # Grid for better readability
+    plt.grid(True, alpha=0.3, axis='y')
+    
+    # Tight layout
+    plt.tight_layout()
+    
+    # Save chart
+    plt.savefig(output_filename, dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    # Print summary
+    print(f"\n=== LEVERAGE vs USD CHART SUMMARY ({chart_type_label}) ===")
+    for leverage in sorted(leverage_values):
+        symbols_at_lev = df[df['leverage'] == leverage]['symbol'].tolist()
+        amounts_at_lev = df[df['leverage'] == leverage]['usd_amount'].tolist()
+        print(f"{int(leverage)}x: {', '.join([f'{s} (${a:,.0f})' for s, a in zip(symbols_at_lev, amounts_at_lev)])}")
 
 def analyze_csv(csv_path: str, symbol_filters: Optional[list] = None, sep: str = ',') -> Dict:
     try:
@@ -295,7 +499,7 @@ def create_excel_tables(results: Dict, percentiles: List[int], output_filename: 
     ws.cell(row=row, column=1, value="4. Leverage Information").font = title_font
     row += 2
 
-    headers = ["Symbol", "Max Leverage", "Min Leverage", "Tiers Count", "Status", "Leverage Tiers"]
+    headers = ["Symbol", "Leverage Tiers"]
     for c, hdr in enumerate(headers, start=1):
         cell = ws.cell(row=row, column=c, value=hdr)
         cell.font = header_font
@@ -310,24 +514,9 @@ def create_excel_tables(results: Dict, percentiles: List[int], output_filename: 
         ws.cell(row=row, column=1).font = Font(bold=True)
         ws.cell(row=row, column=1).fill = leverage_fill
         
-        max_lev = f"{lev_info['max_leverage']}x" if lev_info['max_leverage'] > 0 else "N/A"
-        ws.cell(row=row, column=2, value=max_lev).alignment = center
-        ws.cell(row=row, column=2).fill = leverage_fill
-        
-        min_lev = f"{lev_info['min_leverage']}x" if lev_info['min_leverage'] > 0 else "N/A"
-        ws.cell(row=row, column=3, value=min_lev).alignment = center
-        ws.cell(row=row, column=3).fill = leverage_fill
-        
-        ws.cell(row=row, column=4, value=lev_info['num_tiers']).alignment = center
-        ws.cell(row=row, column=4).fill = leverage_fill
-        
-        status = "✓" if lev_info['status'] == 'success' else "✗"
-        ws.cell(row=row, column=5, value=status).alignment = center
-        ws.cell(row=row, column=5).fill = leverage_fill
-        
         tiers_text = "; ".join([f"{lb} → {lev}" for lb, lev in lev_info['tiers_formatted']]) if lev_info['tiers_formatted'] else "N/A"
-        ws.cell(row=row, column=6, value=tiers_text).alignment = Alignment(horizontal="left", vertical="center")
-        ws.cell(row=row, column=6).fill = leverage_fill
+        ws.cell(row=row, column=2, value=tiers_text).alignment = Alignment(horizontal="left", vertical="center")
+        ws.cell(row=row, column=2).fill = leverage_fill
         
         row += 1
 
@@ -433,25 +622,28 @@ def create_excel_tables(results: Dict, percentiles: List[int], output_filename: 
     for c in range(2, len(symbols)+2):
         ws.column_dimensions[get_column_letter(c)].width = 15
     
-    ws.column_dimensions[get_column_letter(2)].width = 12
-    ws.column_dimensions[get_column_letter(3)].width = 12
-    ws.column_dimensions[get_column_letter(4)].width = 10
-    ws.column_dimensions[get_column_letter(5)].width = 8
-    ws.column_dimensions[get_column_letter(6)].width = 40
+    # Leverage table specific widths
+    ws.column_dimensions[get_column_letter(1)].width = 12  # Symbol
+    ws.column_dimensions[get_column_letter(2)].width = 50  # Leverage Tiers (wider for better readability)
     
+    # Orderbook table widths  
     for c in range(2, len(symbols)*5 + 2):
         ws.column_dimensions[get_column_letter(c)].width = 12
 
     workbook.save(output_filename)
 
 def parse_arguments():
-    parser = argparse.ArgumentParser(description="Volatility and orderbook analysis with configurable percentiles")
+    parser = argparse.ArgumentParser(description="Volatility and orderbook analysis with configurable percentiles and leverage chart")
     parser.add_argument('csv_file', help='Path to CSV file with orderbook data')
     parser.add_argument('symbols', nargs='*', help='Optional: specific symbols to analyze')
     parser.add_argument('--percentiles', nargs='+', type=int, default=DEFAULT_PERCENTILES,
                        help=f'Percentiles to calculate (1-99). Default: {DEFAULT_PERCENTILES}')
     parser.add_argument('--sep', default=',', 
                        help='CSV separator/delimiter (default: ",")')
+    parser.add_argument('--chart-level', type=int, default=1,
+                       help='Orderbook level to use for leverage chart (default: 1)')
+    parser.add_argument('--chart-type', choices=['bid', 'ask', 'avg'], default='avg',
+                       help='Type of data to use for leverage chart: bid, ask, or avg (default: avg)')
     
     args = parser.parse_args()
     
@@ -460,6 +652,13 @@ def parse_arguments():
             parser.error(f"Percentile {p} must be between 1 and 99")
     
     args.percentiles = sorted(set(args.percentiles))
+    
+    # Ensure percentile 50 is included for the chart
+    if 50 not in args.percentiles:
+        args.percentiles.append(50)
+        args.percentiles = sorted(args.percentiles)
+        print("Note: Added percentile 50 (required for leverage chart)")
+    
     return args
 
 def main():
@@ -468,13 +667,24 @@ def main():
     if not Path(args.csv_file).exists():
         raise SystemExit(f"CSV file not found: {args.csv_file}")
 
+    print("Analyzing CSV and fetching leverage data...")
     results = analyze_csv(args.csv_file, args.symbols, sep=args.sep)
+    
+    print("Creating percentile depth tables...")
     csv_paths = save_percentile_depth_csvs(results, args.percentiles)
+    
+    print("Creating Excel tables...")
     create_excel_tables(results, args.percentiles, output_filename=EXCEL_FILENAME)
     
+    print("Extracting median USD data and creating leverage chart...")
+    leverage_usd_data = extract_median_usd_from_p50(results, args.percentiles, args.chart_level)
+    create_leverage_vs_usd_chart(leverage_usd_data, output_filename=CHART_FILENAME, chart_type=args.chart_type)
+    
+    print("\n=== OUTPUT FILES ===")
     for path in csv_paths:
         print(f"{path}")
     print(f"{EXCEL_FILENAME}")
+    print(f"{CHART_FILENAME}")
 
 if __name__ == "__main__":
     main()
