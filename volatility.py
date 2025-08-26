@@ -190,17 +190,6 @@ def _fmt_price(p: float) -> str:
     if p >= 1: return f"{p:.2f}"
     return f"{p:.4f}"
 
-def _get_percentile_colors(perc: int) -> Tuple[PatternFill, PatternFill]:
-    if perc <= 5:
-        return (PatternFill(start_color="D4F3D4", end_color="D4F3D4", fill_type="solid"),
-                PatternFill(start_color="FFE4E4", end_color="FFE4E4", fill_type="solid"))
-    elif perc <= 25:
-        return (PatternFill(start_color="E8F5E8", end_color="E8F5E8", fill_type="solid"),
-                PatternFill(start_color="FFF2F2", end_color="FFF2F2", fill_type="solid"))
-    else:
-        return (PatternFill(start_color="F0F8F0", end_color="F0F8F0", fill_type="solid"),
-                PatternFill(start_color="FFF8F8", end_color="FFF8F8", fill_type="solid"))
-
 def create_excel_tables(results: Dict, percentiles: List[int], output_filename: str = EXCEL_FILENAME) -> None:
     workbook = openpyxl.Workbook()
     ws = workbook.active
@@ -348,7 +337,6 @@ def create_excel_tables(results: Dict, percentiles: List[int], output_filename: 
     table_num = 5
     for perc in sorted(percentiles):
         pct_df = percentile_dfs[perc]
-        pos_fill, neg_fill = _get_percentile_colors(perc)
         
         ws.cell(row=row, column=1, value=f"{table_num}. Orderbook Levels Analysis (p{perc:02d}) - Absolute Spread Distance").font = title_font
         row += 2
@@ -385,14 +373,12 @@ def create_excel_tables(results: Dict, percentiles: List[int], output_filename: 
                 if len(r)==1:
                     spread_val, qty, usd, accq, accusd = r.iloc[0][['spread_distance','qty','usd','acc_qty','acc_usd']]
                     cells = [spread_val, qty, usd, accq, accusd]
-                    fills = [pos_fill]*5
                 else:
-                    cells, fills = ["N/A"]*5, [pos_fill]*5
-                for val, f in zip(cells, fills):
+                    cells = ["N/A"]*5
+                for val in cells:
                     disp = round(val, 3) if isinstance(val, float) and not np.isnan(val) else "N/A" if not isinstance(val, (int, float)) else val
                     c = ws.cell(row=row, column=col, value=disp)
                     c.alignment = center
-                    c.fill = f
                     col += 1
             row += 1
 
@@ -430,14 +416,12 @@ def create_excel_tables(results: Dict, percentiles: List[int], output_filename: 
                 if len(r)==1:
                     spread_val, qty, usd, accq, accusd = r.iloc[0][['spread_distance','qty','usd','acc_qty','acc_usd']]
                     cells = [spread_val, qty, usd, accq, accusd]
-                    fills = [neg_fill]*5
                 else:
-                    cells, fills = ["N/A"]*5, [neg_fill]*5
-                for val, f in zip(cells, fills):
+                    cells = ["N/A"]*5
+                for val in cells:
                     disp = round(val, 3) if isinstance(val, float) and not np.isnan(val) else "N/A" if not isinstance(val, (int, float)) else val
                     c = ws.cell(row=row, column=col, value=disp)
                     c.alignment = center
-                    c.fill = f
                     col += 1
             row += 1
 
