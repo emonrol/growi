@@ -9,6 +9,19 @@ import time
 INFO_URL = "https://api.hyperliquid.xyz/info"
 LEVERAGE_DATA_FILE = "leverage_data.json"
 
+"""
+Enhanced API module for Hyperliquid leverage data management.
+
+This module can fetch leverage information for specific symbols or ALL available symbols,
+and save the results to a JSON file for later use by volatility.py.
+
+Usage examples:
+    python API.py                      # Fetch ALL symbols automatically
+    python API.py BTC ETH SOL          # Fetch specific symbols  
+    python API.py --list               # Show symbols in saved file
+    python API.py --help               # Show all options
+"""
+
 class HLMetaError(Exception):
     pass
 
@@ -221,6 +234,32 @@ def get_leverage_info_safe(token: str, dex: str = "") -> Dict:
             'tiers_formatted': []
         }
 
+def get_all_available_symbols(dex: str = "") -> List[str]:
+    """
+    Fetch all available symbols from the Hyperliquid universe.
+    
+    Args:
+        dex: Optional DEX parameter for API
+        
+    Returns:
+        List of all available symbol names
+    """
+    try:
+        print("Fetching universe data to get all available symbols...")
+        meta = fetch_perp_meta(dex=dex)
+        universe = meta.get("universe", [])
+        
+        symbols = []
+        for asset in universe:
+            if "name" in asset:
+                symbols.append(asset["name"])
+        
+        print(f"Found {len(symbols)} available symbols")
+        return sorted(symbols)
+        
+    except Exception as e:
+        raise SystemExit(f"Error fetching universe data: {e}")
+
 def save_leverage_data(symbols: List[str], output_file: str = LEVERAGE_DATA_FILE, dex: str = "") -> None:
     """
     Fetch leverage data for multiple symbols and save to JSON file.
@@ -236,9 +275,24 @@ def save_leverage_data(symbols: List[str], output_file: str = LEVERAGE_DATA_FILE
     }
     
     print(f"Fetching leverage data for {len(symbols)} symbols...")
+    start_time = time.time()
     
     for i, symbol in enumerate(symbols, 1):
-        print(f"[{i}/{len(symbols)}] Fetching {symbol}...")
+        elapsed = time.time() - start_time
+        avg_time_per_symbol = elapsed / (i - 1) if i > 1 else 0
+        remaining_symbols = len(symbols) - i
+        eta_seconds = avg_time_per_symbol * remaining_symbols
+        
+        eta_str = ""
+        if eta_seconds > 0 and i > 3:  # Only show ETA after a few symbols
+            eta_minutes = eta_seconds / 60
+            if eta_minutes > 1:
+                eta_str = f" (ETA: {eta_minutes:.1f}m)"
+            else:
+                eta_str = f" (ETA: {eta_seconds:.0f}s)"
+        
+        print(f"[{i}/{len(symbols)}] Fetching {symbol}...{eta_str}")
+        
         try:
             data = get_leverage_info_safe(symbol, dex=dex)
             leverage_data['symbols'][symbol] = data
@@ -263,6 +317,8 @@ def save_leverage_data(symbols: List[str], output_file: str = LEVERAGE_DATA_FILE
                 'tiers_formatted': []
             }
     
+    total_time = time.time() - start_time
+    
     # Save to file
     try:
         with open(output_file, 'w') as f:
@@ -270,6 +326,7 @@ def save_leverage_data(symbols: List[str], output_file: str = LEVERAGE_DATA_FILE
         print(f"\n✓ Leverage data saved to: {output_file}")
         print(f"  Timestamp: {time.ctime(leverage_data['timestamp'])}")
         print(f"  Symbols: {len(leverage_data['symbols'])}")
+        print(f"  Total time: {total_time:.1f} seconds ({total_time/60:.1f} minutes)")
         
         # Summary
         success_count = sum(1 for data in leverage_data['symbols'].values() if data['status'] == 'success')
@@ -277,6 +334,9 @@ def save_leverage_data(symbols: List[str], output_file: str = LEVERAGE_DATA_FILE
         error_count = sum(1 for data in leverage_data['symbols'].values() if data['status'] == 'error')
         
         print(f"  Results: {success_count} success, {partial_count} partial, {error_count} errors")
+        
+        if success_count + partial_count > 0:
+            print(f"\n🎯 Ready for analysis! Run: python volatility.py your_data.csv")
         
     except Exception as e:
         raise SystemExit(f"Error saving leverage data: {e}")
@@ -366,7 +426,7 @@ def get_leverage_info_from_file(symbol: str, input_file: str = LEVERAGE_DATA_FIL
 def parse_arguments():
     parser = argparse.ArgumentParser(description="Fetch and save leverage data for crypto symbols")
     parser.add_argument('symbols', nargs='*', 
-                       help='Symbols to fetch leverage data for (if none provided, shows available symbols)')
+                       help='Symbols to fetch leverage data for (if none provided, fetches ALL symbols)')
     parser.add_argument('--output', '-o', default=LEVERAGE_DATA_FILE,
                        help=f'Output JSON file (default: {LEVERAGE_DATA_FILE})')
     parser.add_argument('--dex', default="",
@@ -407,16 +467,16 @@ def main():
             print(f"No leverage data file found: {args.output}")
         return
     
-    if not args.symbols:
-        # No symbols provided - show usage
-        print("No symbols provided. Usage examples:")
-        print(f"  python {sys.argv[0]} BTC ETH SOL")
-        print(f"  python {sys.argv[0]} --list")
-        print(f"  python {sys.argv[0]} --help")
-        return
+    # Determine which symbols to fetch
+    if args.symbols:
+        # Use provided symbols
+        symbols = args.symbols
+    else:
+        # No symbols provided - fetch all symbols automatically
+        symbols = get_all_available_symbols(args.dex)
     
     # Fetch and save leverage data
-    save_leverage_data(args.symbols, args.output, args.dex)
+    save_leverage_data(symbols, args.output, args.dex)
 
 if __name__ == "__main__":
     main()
