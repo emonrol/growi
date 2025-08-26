@@ -12,6 +12,7 @@ Usage:
 python volatility.py data.csv                              # Default percentiles [1, 10, 25, 50]
 python volatility.py data.csv BTC ETH                      # Subset of symbols
 python volatility.py data.csv --percentiles 5 25 75       # Custom percentiles
+python volatility.py data.csv --sep ";"                   # Custom CSV separator
 """
 
 import sys
@@ -25,8 +26,8 @@ from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
 
 sys.path.append("/home/eric/Documents/growi")
-from orderbook_utils import parse_orderbook_blob, validate_required_columns, REQUIRED_CSV_COLUMNS
-from API import effective_max_leverage_for_notional, HLMetaError
+from orderbook_utils import parse_orderbook_blob, validate_required_columns, REQUIRED_CSV_COLUMNS, _normalize_number
+from API import get_leverage_info_safe, HLMetaError
 
 DEFAULT_PERCENTILES = [1, 10, 25, 50]
 EXCEL_FILENAME = "volatility_analysis.xlsx"
@@ -51,27 +52,11 @@ def calculate_volatility_metrics(log_returns: pd.Series) -> Dict[str, float]:
     }
 
 def fetch_leverage_info(symbol: str) -> Dict:
-    try:
-        leverage_data = effective_max_leverage_for_notional(symbol)
-        if symbol in leverage_data:
-            tiers = leverage_data[symbol]
-            max_lev = max(lev for _, lev in tiers) if tiers else 0
-            min_lev = min(lev for _, lev in tiers) if tiers else 0
-            return {
-                'status': 'success', 'max_leverage': max_lev, 'min_leverage': min_lev,
-                'num_tiers': len(tiers), 'tiers': tiers,
-                'tiers_formatted': [(f"${lb:,.0f}", f"{lev}x") for lb, lev in tiers]
-            }
-        else:
-            return {'status': 'error', 'error': f'Symbol {symbol} not found in API response',
-                   'max_leverage': 0, 'min_leverage': 0, 'num_tiers': 0, 'tiers': [], 'tiers_formatted': []}
-    except (HLMetaError, Exception) as e:
-        return {'status': 'error', 'error': str(e), 'max_leverage': 0, 'min_leverage': 0,
-               'num_tiers': 0, 'tiers': [], 'tiers_formatted': []}
+    return get_leverage_info_safe(symbol)
 
-def analyze_csv(csv_path: str, symbol_filters: Optional[list] = None) -> Dict:
+def analyze_csv(csv_path: str, symbol_filters: Optional[list] = None, sep: str = ',') -> Dict:
     try:
-        df = pd.read_csv(csv_path)
+        df = pd.read_csv(csv_path, sep=sep, engine='python')
     except Exception as e:
         raise SystemExit(f"Error reading CSV: {e}")
 
@@ -93,7 +78,9 @@ def analyze_csv(csv_path: str, symbol_filters: Optional[list] = None) -> Dict:
     results = {}
     for symbol in df['symbol'].unique():
         sdf = df[df['symbol'] == symbol].copy()
-        prices = sdf['base_price'].astype(float)
+        prices = sdf['base_price'].apply(_normalize_number)
+        prices = pd.Series(prices, dtype=float)  # Convert to float Series
+        
         if 'ts' in sdf.columns:
             prices.index = sdf['ts']
 
@@ -121,7 +108,7 @@ def analyze_csv(csv_path: str, symbol_filters: Optional[list] = None) -> Dict:
 def _collect_levels_for_symbol(symbol_df: pd.DataFrame, side: str) -> Dict[int, Dict[str, list]]:
     out = {}
     for _, row in symbol_df.iterrows():
-        base_price = float(row['base_price'])
+        base_price = _normalize_number(row['base_price'])  # Handle European decimal format
         if side not in row or pd.isna(row[side]):
             continue
         try:
@@ -479,6 +466,8 @@ def parse_arguments():
     parser.add_argument('symbols', nargs='*', help='Optional: specific symbols to analyze')
     parser.add_argument('--percentiles', nargs='+', type=int, default=DEFAULT_PERCENTILES,
                        help=f'Percentiles to calculate (1-99). Default: {DEFAULT_PERCENTILES}')
+    parser.add_argument('--sep', default=',', 
+                       help='CSV separator/delimiter (default: ",")')
     
     args = parser.parse_args()
     
@@ -495,7 +484,7 @@ def main():
     if not Path(args.csv_file).exists():
         raise SystemExit(f"CSV file not found: {args.csv_file}")
 
-    results = analyze_csv(args.csv_file, args.symbols)
+    results = analyze_csv(args.csv_file, args.symbols, sep=args.sep)
     csv_paths = save_percentile_depth_csvs(results, args.percentiles)
     create_excel_tables(results, args.percentiles, output_filename=EXCEL_FILENAME)
     
