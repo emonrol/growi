@@ -376,42 +376,36 @@ def create_token_levels_chart(time_series_data: Dict[str, Dict], symbol: str,
     
     plt.figure(figsize=(15, 10))
     
-    # Convert to DataFrame for easier continuous line plotting
-    df = pd.DataFrame({
-        'timestamp': pd.to_datetime(timestamps),
-        'base_price': data['base_prices']
-    })
-    
-    # Add orderbook levels to DataFrame
-    for level in range(1, max_levels + 1):
-        df[f'bid_L{level}'] = data['bid_levels'][level]
-        df[f'ask_L{level}'] = data['ask_levels'][level]
-    
-    # Set timestamp as index
-    df.set_index('timestamp', inplace=True)
+    # Convert timestamps to pandas datetime for better plotting
+    timestamps = pd.to_datetime(timestamps)
     
     # Plot base price as reference
-    df['base_price'].plot(label='Base Price', color='black', linewidth=2, alpha=0.8)
+    base_prices = data['base_prices']
+    plt.plot(timestamps, base_prices, label='Base Price', color='black', linewidth=2, alpha=0.8)
     
     # Colors for different levels
     bid_colors = plt.cm.Blues(np.linspace(0.4, 1, max_levels))
     ask_colors = plt.cm.Reds(np.linspace(0.4, 1, max_levels))
     
-    # Plot bid levels as continuous lines
+    # Plot bid levels
     for level in range(1, max_levels + 1):
-        bid_col = f'bid_L{level}'
-        if bid_col in df.columns and df[bid_col].notna().any():
-            # Plot only non-NaN values as continuous line
-            df[bid_col].dropna().plot(label=f'Bid L{level}', color=bid_colors[level-1], 
-                                    alpha=0.7, linewidth=1.5, linestyle='-')
+        bid_prices = data['bid_levels'][level]
+        if any(not np.isnan(p) for p in bid_prices):
+            # Convert NaN to None for proper line plotting
+            bid_prices_clean = [p if not np.isnan(p) else None for p in bid_prices]
+            plt.plot(timestamps, bid_prices_clean, 
+                    label=f'Bid L{level}', color=bid_colors[level-1], 
+                    alpha=0.7, linewidth=1.5, linestyle='-')
     
-    # Plot ask levels as continuous lines
+    # Plot ask levels
     for level in range(1, max_levels + 1):
-        ask_col = f'ask_L{level}'
-        if ask_col in df.columns and df[ask_col].notna().any():
-            # Plot only non-NaN values as continuous line
-            df[ask_col].dropna().plot(label=f'Ask L{level}', color=ask_colors[level-1], 
-                                    alpha=0.7, linewidth=1.5, linestyle='--')
+        ask_prices = data['ask_levels'][level]
+        if any(not np.isnan(p) for p in ask_prices):
+            # Convert NaN to None for proper line plotting
+            ask_prices_clean = [p if not np.isnan(p) else None for p in ask_prices]
+            plt.plot(timestamps, ask_prices_clean, 
+                    label=f'Ask L{level}', color=ask_colors[level-1], 
+                    alpha=0.7, linewidth=1.5, linestyle='--')
     
     plt.xlabel('Time', fontsize=12, fontweight='bold')
     plt.ylabel('Price (Token Units)', fontsize=12, fontweight='bold')
@@ -459,42 +453,36 @@ def create_usd_levels_chart(time_series_data: Dict[str, Dict], symbol: str,
     
     plt.figure(figsize=(15, 10))
     
-    # Convert to DataFrame for easier continuous line plotting
-    df = pd.DataFrame({
-        'timestamp': pd.to_datetime(timestamps),
-        'base_price': data['base_prices']
-    })
-    
-    # Add orderbook levels to DataFrame
-    for level in range(1, max_levels + 1):
-        df[f'bid_L{level}'] = data['bid_levels'][level]
-        df[f'ask_L{level}'] = data['ask_levels'][level]
-    
-    # Set timestamp as index
-    df.set_index('timestamp', inplace=True)
+    # Convert timestamps to pandas datetime for better plotting
+    timestamps = pd.to_datetime(timestamps)
     
     # Plot base price as reference
-    df['base_price'].plot(label='Base Price', color='black', linewidth=2, alpha=0.8)
+    base_prices = data['base_prices']
+    plt.plot(timestamps, base_prices, label='Base Price', color='black', linewidth=2, alpha=0.8)
     
     # Colors for different levels
     bid_colors = plt.cm.Blues(np.linspace(0.4, 1, max_levels))
     ask_colors = plt.cm.Reds(np.linspace(0.4, 1, max_levels))
     
-    # Plot bid levels as continuous lines
+    # Plot bid levels
     for level in range(1, max_levels + 1):
-        bid_col = f'bid_L{level}'
-        if bid_col in df.columns and df[bid_col].notna().any():
-            # Plot only non-NaN values as continuous line
-            df[bid_col].dropna().plot(label=f'Bid L{level}', color=bid_colors[level-1], 
-                                    alpha=0.7, linewidth=1.5, linestyle='-')
+        bid_prices = data['bid_levels'][level]
+        if any(not np.isnan(p) for p in bid_prices):
+            # Convert NaN to None for proper line plotting
+            bid_prices_clean = [p if not np.isnan(p) else None for p in bid_prices]
+            plt.plot(timestamps, bid_prices_clean, 
+                    label=f'Bid L{level}', color=bid_colors[level-1], 
+                    alpha=0.7, linewidth=1.5, linestyle='-')
     
-    # Plot ask levels as continuous lines  
+    # Plot ask levels  
     for level in range(1, max_levels + 1):
-        ask_col = f'ask_L{level}'
-        if ask_col in df.columns and df[ask_col].notna().any():
-            # Plot only non-NaN values as continuous line
-            df[ask_col].dropna().plot(label=f'Ask L{level}', color=ask_colors[level-1], 
-                                    alpha=0.7, linewidth=1.5, linestyle='--')
+        ask_prices = data['ask_levels'][level]
+        if any(not np.isnan(p) for p in ask_prices):
+            # Convert NaN to None for proper line plotting
+            ask_prices_clean = [p if not np.isnan(p) else None for p in ask_prices]
+            plt.plot(timestamps, ask_prices_clean, 
+                    label=f'Ask L{level}', color=ask_colors[level-1], 
+                    alpha=0.7, linewidth=1.5, linestyle='--')
     
     plt.xlabel('Time', fontsize=12, fontweight='bold')
     plt.ylabel('Price (USD)', fontsize=12, fontweight='bold')  
