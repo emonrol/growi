@@ -584,6 +584,9 @@ def _collect_levels_for_symbol(symbol_df: pd.DataFrame, side: str) -> Dict[int, 
 def _percentile(series: List[float], q: float) -> float:
     return float(pd.Series(series).quantile(q)) if series else float('nan')
 
+def _mean(series: List[float]) -> float:
+    return float(pd.Series(series).mean()) if series else float('nan')
+
 def build_percentile_depth(results: Dict, percentiles: List[int]) -> Dict[int, pd.DataFrame]:
     percentile_dfs = {}
     
@@ -618,6 +621,44 @@ def build_percentile_depth(results: Dict, percentiles: List[int]) -> Dict[int, p
     
     return percentile_dfs
 
+def build_mean_depth(results: Dict) -> pd.DataFrame:
+    """
+    Build mean depth data similar to percentile depth but using means instead of percentiles.
+    
+    Args:
+        results: Analysis results from analyze_csv
+    
+    Returns:
+        DataFrame with mean depth data
+    """
+    rows = []
+    
+    for symbol, blob in results.items():
+        sdf = blob['df']
+        for side in ('bids', 'asks'):
+            buckets = _collect_levels_for_symbol(sdf, side)
+            acc_qty = acc_usd = 0.0
+            for lvl in sorted(buckets.keys()):
+                b = buckets[lvl]
+                spread_m, qty_m, usd_m = _mean(b['spread_distance']), _mean(b['qty']), _mean(b['usd'])
+                if not np.isnan(qty_m): acc_qty += qty_m
+                if not np.isnan(usd_m): acc_usd += usd_m
+                rows.append({
+                    'symbol': symbol, 'side': 'bid' if side == 'bids' else 'ask', 'level': lvl,
+                    'spread_distance': round(spread_m, 3) if not np.isnan(spread_m) else np.nan,
+                    'qty': round(qty_m, 6) if not np.isnan(qty_m) else np.nan,
+                    'usd': round(usd_m, 2) if not np.isnan(usd_m) else np.nan,
+                    'acc_qty': round(acc_qty, 6) if not np.isnan(acc_qty) else np.nan,
+                    'acc_usd': round(acc_usd, 2) if not np.isnan(acc_usd) else np.nan,
+                    'obs_count': len(b['qty'])
+                })
+    
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df.sort_values(['symbol', 'side', 'level']).reset_index(drop=True)
+    
+    return df
+
 def save_percentile_depth_csvs(results: Dict, percentiles: List[int]) -> List[Path]:
     percentile_dfs = build_percentile_depth(results, percentiles)
     output_paths = []
@@ -644,7 +685,7 @@ def _fmt_price(p: float) -> str:
 
 def create_new_percentile_tables(results: Dict, percentiles: List[int], ws, start_row: int) -> int:
     """
-    Create new percentile tables with all percentiles side by side.
+    Create new percentile tables with all percentiles side by side, plus mean columns at the end.
     
     Args:
         results: Analysis results
@@ -655,13 +696,15 @@ def create_new_percentile_tables(results: Dict, percentiles: List[int], ws, star
     Returns:
         Next available row number
     """
-    # Get percentile data
+    # Get percentile data and mean data
     percentile_dfs = build_percentile_depth(results, percentiles)
+    mean_df = build_mean_depth(results)
     
     # Get symbols and determine max levels
     symbols = list(results.keys())
     max_levels = {}
     
+    # Check percentile data for max levels
     for perc in percentiles:
         pct_df = percentile_dfs[perc]
         for side in ['ask', 'bid']:
@@ -671,25 +714,35 @@ def create_new_percentile_tables(results: Dict, percentiles: List[int], ws, star
                     max_level = symbol_data['level'].max()
                     max_levels[symbol] = max(max_levels.get(symbol, 0), max_level)
     
+    # Check mean data for max levels
+    for side in ['ask', 'bid']:
+        for symbol in symbols:
+            symbol_data = mean_df[(mean_df['symbol'] == symbol) & (mean_df['side'] == side)]
+            if not symbol_data.empty:
+                max_level = symbol_data['level'].max()
+                max_levels[symbol] = max(max_levels.get(symbol, 0), max_level)
+    
     # Determine overall max level across all symbols
     overall_max_level = max(max_levels.values()) if max_levels else 5
     
     # Define styles
     header_font = Font(bold=True, size=12, color="FFFFFF")
     header_fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
+    mean_header_fill = PatternFill(start_color="FF6B35", end_color="FF6B35", fill_type="solid")  # Orange for mean columns
     title_font = Font(bold=True, size=14, color="000000")
     center = Alignment(horizontal="center", vertical="center")
     
     current_row = start_row
     
-    # BIG TABLE A: Token Quantities (All Percentiles Side by Side)
-    ws.cell(row=current_row, column=1, value="5. Token Quantities - All Percentiles (Accumulated Quantities)").font = title_font
+    # BIG TABLE A: Token Quantities (All Percentiles Side by Side + Mean Columns)
+    ws.cell(row=current_row, column=1, value="5. Token Quantities - All Percentiles + Means (Accumulated Quantities)").font = title_font
     current_row += 2
     
-    # Calculate header structure for all percentiles
+    # Calculate header structure for all percentiles + means
     col = 2
     header_positions = []
     
+    # Percentile columns
     for perc in sorted(percentiles):
         for side in ['Ask', 'Bid']:
             start_col = col
@@ -707,23 +760,44 @@ def create_new_percentile_tables(results: Dict, percentiles: List[int], ws, star
                 merged_cell.fill = header_fill
                 merged_cell.alignment = center
     
+    # Mean columns
+    for side in ['Ask', 'Bid']:
+        start_col = col
+        # Create merged header for this side-mean combination
+        for level in range(1, overall_max_level + 1):
+            header_positions.append((current_row + 1, col, f'N{level}-mean'))
+            col += 1
+        end_col = col - 1
+        
+        # Merge cells for side-mean header
+        if start_col <= end_col:
+            ws.merge_cells(start_row=current_row, start_column=start_col, end_row=current_row, end_column=end_col)
+            merged_cell = ws.cell(row=current_row, column=start_col, value=f"{side} (mean)")
+            merged_cell.font = header_font
+            merged_cell.fill = mean_header_fill
+            merged_cell.alignment = center
+    
     current_row += 1
     
     # Second header row with level labels
     for row_num, col_num, label in header_positions:
         cell = ws.cell(row=row_num, column=col_num, value=label)
         cell.font = header_font
-        cell.fill = header_fill
+        if 'mean' in label:
+            cell.fill = mean_header_fill
+        else:
+            cell.fill = header_fill
         cell.alignment = center
     
     current_row += 1
     
-    # Data rows for token quantities (all percentiles)
+    # Data rows for token quantities (all percentiles + means)
     for symbol in symbols:
         ws.cell(row=current_row, column=1, value=symbol).font = Font(bold=True)
         ws.cell(row=current_row, column=1).alignment = center
         
         col = 2
+        # Percentile data
         for perc in sorted(percentiles):
             pct_df = percentile_dfs[perc]
             for side in ['ask', 'bid']:
@@ -742,18 +816,36 @@ def create_new_percentile_tables(results: Dict, percentiles: List[int], ws, star
                     ws.cell(row=current_row, column=col, value=display_val).alignment = center
                     col += 1
         
+        # Mean data
+        for side in ['ask', 'bid']:
+            for level in range(1, overall_max_level + 1):
+                # Get mean data for this combination
+                data_row = mean_df[(mean_df['symbol'] == symbol) & 
+                                  (mean_df['side'] == side) & 
+                                  (mean_df['level'] == level)]
+                
+                if len(data_row) > 0:
+                    value = data_row['acc_qty'].iloc[0]
+                    display_val = round(value, 6) if not pd.isna(value) else "N/A"
+                else:
+                    display_val = "N/A"
+                
+                ws.cell(row=current_row, column=col, value=display_val).alignment = center
+                col += 1
+        
         current_row += 1
     
     current_row += 3
     
-    # BIG TABLE B: USD Values (All Percentiles Side by Side)
-    ws.cell(row=current_row, column=1, value="6. USD Values - All Percentiles (Accumulated USD)").font = title_font
+    # BIG TABLE B: USD Values (All Percentiles Side by Side + Mean Columns)
+    ws.cell(row=current_row, column=1, value="6. USD Values - All Percentiles + Means (Accumulated USD)").font = title_font
     current_row += 2
     
     # Reset column counter and header positions
     col = 2
     header_positions = []
     
+    # Percentile columns
     for perc in sorted(percentiles):
         for side in ['Ask', 'Bid']:
             start_col = col
@@ -771,23 +863,44 @@ def create_new_percentile_tables(results: Dict, percentiles: List[int], ws, star
                 merged_cell.fill = header_fill
                 merged_cell.alignment = center
     
+    # Mean columns
+    for side in ['Ask', 'Bid']:
+        start_col = col
+        # Create merged header for this side-mean combination
+        for level in range(1, overall_max_level + 1):
+            header_positions.append((current_row + 1, col, f'N{level}-mean'))
+            col += 1
+        end_col = col - 1
+        
+        # Merge cells for side-mean header
+        if start_col <= end_col:
+            ws.merge_cells(start_row=current_row, start_column=start_col, end_row=current_row, end_column=end_col)
+            merged_cell = ws.cell(row=current_row, column=start_col, value=f"{side} (mean)")
+            merged_cell.font = header_font
+            merged_cell.fill = mean_header_fill
+            merged_cell.alignment = center
+    
     current_row += 1
     
     # Second header row with level labels
     for row_num, col_num, label in header_positions:
         cell = ws.cell(row=row_num, column=col_num, value=label)
         cell.font = header_font
-        cell.fill = header_fill
+        if 'mean' in label:
+            cell.fill = mean_header_fill
+        else:
+            cell.fill = header_fill
         cell.alignment = center
     
     current_row += 1
     
-    # Data rows for USD values (all percentiles)
+    # Data rows for USD values (all percentiles + means)
     for symbol in symbols:
         ws.cell(row=current_row, column=1, value=symbol).font = Font(bold=True)
         ws.cell(row=current_row, column=1).alignment = center
         
         col = 2
+        # Percentile data
         for perc in sorted(percentiles):
             pct_df = percentile_dfs[perc]
             for side in ['ask', 'bid']:
@@ -806,20 +919,40 @@ def create_new_percentile_tables(results: Dict, percentiles: List[int], ws, star
                     ws.cell(row=current_row, column=col, value=display_val).alignment = center
                     col += 1
         
+        # Mean data
+        for side in ['ask', 'bid']:
+            for level in range(1, overall_max_level + 1):
+                # Get mean data for this combination
+                data_row = mean_df[(mean_df['symbol'] == symbol) & 
+                                  (mean_df['side'] == side) & 
+                                  (mean_df['level'] == level)]
+                
+                if len(data_row) > 0:
+                    value = data_row['acc_usd'].iloc[0]
+                    display_val = f"${round(value, 2)}" if not pd.isna(value) else "N/A"
+                else:
+                    display_val = "N/A"
+                
+                ws.cell(row=current_row, column=col, value=display_val).alignment = center
+                col += 1
+        
         current_row += 1
     
     current_row += 3
     
-    # Table C: Summary
-    ws.cell(row=current_row, column=1, value="7. Summary - Average Spread Distances").font = title_font
+    # Table C: Summary (updated to include mean averages)
+    ws.cell(row=current_row, column=1, value="7. Summary - Average Spread Distances (Percentiles + Means)").font = title_font
     current_row += 2
     
     # Summary table headers
-    headers = ["Token", "Level", "Avg Delta Ask %", "Avg Delta Bid %"]
+    headers = ["Token", "Level", "Avg Delta Ask % (Percentiles)", "Avg Delta Bid % (Percentiles)", "Avg Delta Ask % (Mean)", "Avg Delta Bid % (Mean)"]
     for c, hdr in enumerate(headers, start=1):
         cell = ws.cell(row=current_row, column=c, value=hdr)
         cell.font = header_font
-        cell.fill = header_fill
+        if "Mean" in hdr:
+            cell.fill = mean_header_fill
+        else:
+            cell.fill = header_fill
         cell.alignment = center
     current_row += 1
     
@@ -827,8 +960,8 @@ def create_new_percentile_tables(results: Dict, percentiles: List[int], ws, star
     for symbol in symbols:
         for level in range(1, max_levels.get(symbol, overall_max_level) + 1):
             # Calculate average spread distances across all percentiles
-            ask_spreads = []
-            bid_spreads = []
+            ask_spreads_pct = []
+            bid_spreads_pct = []
             
             for perc in percentiles:
                 pct_df = percentile_dfs[perc]
@@ -837,22 +970,35 @@ def create_new_percentile_tables(results: Dict, percentiles: List[int], ws, star
                                  (pct_df['side'] == 'ask') & 
                                  (pct_df['level'] == level)]
                 if len(ask_data) > 0 and not pd.isna(ask_data['spread_distance'].iloc[0]):
-                    ask_spreads.append(ask_data['spread_distance'].iloc[0])
+                    ask_spreads_pct.append(ask_data['spread_distance'].iloc[0])
                 
                 bid_data = pct_df[(pct_df['symbol'] == symbol) & 
                                  (pct_df['side'] == 'bid') & 
                                  (pct_df['level'] == level)]
                 if len(bid_data) > 0 and not pd.isna(bid_data['spread_distance'].iloc[0]):
-                    bid_spreads.append(bid_data['spread_distance'].iloc[0])
+                    bid_spreads_pct.append(bid_data['spread_distance'].iloc[0])
             
-            avg_ask = np.mean(ask_spreads) if ask_spreads else np.nan
-            avg_bid = np.mean(bid_spreads) if bid_spreads else np.nan
+            # Get mean spread distances
+            ask_data_mean = mean_df[(mean_df['symbol'] == symbol) & 
+                                   (mean_df['side'] == 'ask') & 
+                                   (mean_df['level'] == level)]
+            bid_data_mean = mean_df[(mean_df['symbol'] == symbol) & 
+                                   (mean_df['side'] == 'bid') & 
+                                   (mean_df['level'] == level)]
+            
+            ask_spread_mean = ask_data_mean['spread_distance'].iloc[0] if len(ask_data_mean) > 0 and not pd.isna(ask_data_mean['spread_distance'].iloc[0]) else np.nan
+            bid_spread_mean = bid_data_mean['spread_distance'].iloc[0] if len(bid_data_mean) > 0 and not pd.isna(bid_data_mean['spread_distance'].iloc[0]) else np.nan
+            
+            avg_ask_pct = np.mean(ask_spreads_pct) if ask_spreads_pct else np.nan
+            avg_bid_pct = np.mean(bid_spreads_pct) if bid_spreads_pct else np.nan
             
             # Write summary row
             ws.cell(row=current_row, column=1, value=symbol).alignment = center
             ws.cell(row=current_row, column=2, value=f"N{level}").alignment = center
-            ws.cell(row=current_row, column=3, value=round(avg_ask, 3) if not np.isnan(avg_ask) else "N/A").alignment = center
-            ws.cell(row=current_row, column=4, value=round(avg_bid, 3) if not np.isnan(avg_bid) else "N/A").alignment = center
+            ws.cell(row=current_row, column=3, value=round(avg_ask_pct, 3) if not np.isnan(avg_ask_pct) else "N/A").alignment = center
+            ws.cell(row=current_row, column=4, value=round(avg_bid_pct, 3) if not np.isnan(avg_bid_pct) else "N/A").alignment = center
+            ws.cell(row=current_row, column=5, value=round(ask_spread_mean, 3) if not np.isnan(ask_spread_mean) else "N/A").alignment = center
+            ws.cell(row=current_row, column=6, value=round(bid_spread_mean, 3) if not np.isnan(bid_spread_mean) else "N/A").alignment = center
             
             current_row += 1
     
@@ -985,12 +1131,12 @@ def create_excel_tables(results: Dict, percentiles: List[int], output_filename: 
 
     row += 2
 
-    # New Percentile Tables (replaces the old ones)
+    # New Percentile Tables (replaces the old ones and includes means)
     row = create_new_percentile_tables(results, percentiles, ws, row)
 
-    # Column widths
+    # Column widths - increased for more columns
     ws.column_dimensions['A'].width = 12
-    for c in range(2, len(symbols)+10):
+    for c in range(2, len(symbols) + 50):  # More columns due to mean data
         ws.column_dimensions[get_column_letter(c)].width = 12
 
     workbook.save(output_filename)
