@@ -683,6 +683,108 @@ def _fmt_price(p: float) -> str:
     if p >= 1: return f"{p:.2f}"
     return f"{p:.4f}"
 
+def _fmt_volume(v: float) -> str:
+    """Format volume in USD with appropriate scaling"""
+    if v is None or (isinstance(v, float) and np.isnan(v)): return "N/A"
+    if v >= 1000000: return f"${v/1000000:.1f}M"
+    if v >= 1000: return f"${v/1000:.0f}K"
+    return f"${v:.0f}"
+
+def calculate_max_investment_volume(symbol_df: pd.DataFrame, target_price: float, side: str) -> float:
+    """
+    Calculate maximum USD investment volume needed to reach target price by absorbing orderbook levels.
+    
+    Args:
+        symbol_df: DataFrame with orderbook data for the symbol
+        target_price: Target price to reach
+        side: 'buy' for absorbing asks, 'sell' for absorbing bids
+    
+    Returns:
+        Total USD volume needed to reach target price
+    """
+    total_volume_usd = 0.0
+    
+    # Get the most recent orderbook snapshot (last row)
+    if len(symbol_df) == 0:
+        return 0.0
+    
+    last_row = symbol_df.iloc[-1]
+    base_price = _normalize_number(last_row['base_price'])
+    
+    if pd.isna(base_price) or base_price <= 0:
+        return 0.0
+    
+    # Parse orderbook levels
+    orderbook_side = 'asks' if side == 'buy' else 'bids'
+    
+    if orderbook_side not in last_row or pd.isna(last_row[orderbook_side]):
+        return 0.0
+    
+    try:
+        levels = parse_orderbook_blob(last_row[orderbook_side])
+    except Exception:
+        return 0.0
+    
+    if not levels:
+        return 0.0
+    
+    # Sort levels appropriately
+    if side == 'buy':
+        # For buying, we want asks sorted by price (ascending)
+        levels = sorted(levels, key=lambda x: float(x['px']))
+        # Check if target is reachable
+        if target_price < float(levels[0]['px']):
+            return 0.0
+    else:
+        # For selling, we want bids sorted by price (descending)
+        levels = sorted(levels, key=lambda x: float(x['px']), reverse=True)
+        # Check if target is reachable
+        if target_price > float(levels[0]['px']):
+            return 0.0
+    
+    # Accumulate volume level by level
+    prev_price = None
+    
+    for i, level in enumerate(levels):
+        try:
+            level_price = float(level['px'])
+            level_size = float(level['sz'])
+        except (ValueError, KeyError):
+            continue
+        
+        if side == 'buy':
+            if level_price <= target_price:
+                # Absorb entire level
+                total_volume_usd += level_price * level_size
+                prev_price = level_price
+            else:
+                # Target price falls between prev_price and level_price
+                if prev_price is not None and i > 0:
+                    # Linear interpolation
+                    price_range = level_price - prev_price
+                    target_offset = target_price - prev_price
+                    interpolation_factor = target_offset / price_range if price_range > 0 else 0
+                    interpolated_size = level_size * interpolation_factor
+                    total_volume_usd += target_price * interpolated_size
+                break
+        else:  # sell
+            if level_price >= target_price:
+                # Absorb entire level
+                total_volume_usd += level_price * level_size
+                prev_price = level_price
+            else:
+                # Target price falls between level_price and prev_price
+                if prev_price is not None and i > 0:
+                    # Linear interpolation
+                    price_range = prev_price - level_price
+                    target_offset = prev_price - target_price
+                    interpolation_factor = target_offset / price_range if price_range > 0 else 0
+                    interpolated_size = level_size * interpolation_factor
+                    total_volume_usd += target_price * interpolated_size
+                break
+    
+    return total_volume_usd
+
 def create_new_percentile_tables(results: Dict, percentiles: List[int], ws, start_row: int) -> int:
     """
     Create new percentile tables with all percentiles side by side, plus mean columns at the end.
@@ -1078,58 +1180,66 @@ def create_excel_tables(results: Dict, percentiles: List[int], output_filename: 
 
     row += 2
 
-    # Table 2: Buy target prices
-    ws.cell(row=row, column=1, value="2. Buy Target Prices - Base Price + Slippage").font = title_font
+    # Table 2: Buy Investment Volumes 
+    ws.cell(row=row, column=1, value="2. Max Investment Volume to Buy (Absorbing Ask Levels)").font = title_font
     row += 2
 
-    ws.cell(row=row, column=1, value="Minutes").font = header_font
-    ws.cell(row=row, column=1).fill = header_fill
-    ws.cell(row=row, column=1).alignment = center
-
-    for c, sym in enumerate(symbols, start=2):
-        bp = results[sym]['price_stats']['latest_price']
-        ws.cell(row=row, column=c, value=f"{sym} ($ {_fmt_price(bp)})").font = header_font
-        ws.cell(row=row, column=c).fill = header_fill
-        ws.cell(row=row, column=c).alignment = center
+    # Headers: Symbol + time periods
+    headers = ["Symbol"] + [("1 day" if tl=="1day" else "1 year" if tl=="1year" else tl) for tl in time_labels]
+    
+    for c, hdr in enumerate(headers, start=1):
+        cell = ws.cell(row=row, column=c, value=hdr)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = center
     row += 1
 
-    for tl, vk in zip(time_labels, vol_keys):
-        label = "1 day" if tl=="1day" else "1 year" if tl=="1year" else tl
-        ws.cell(row=row, column=1, value=label).alignment = center
-        ws.cell(row=row, column=1).font = Font(bold=True)
-        for c, sym in enumerate(symbols, start=2):
-            base_price = results[sym]['price_stats']['latest_price']
+    # Data rows: each symbol with max investment volumes for buy targets
+    for sym in symbols:
+        ws.cell(row=row, column=1, value=sym).font = Font(bold=True)
+        ws.cell(row=row, column=1).alignment = center
+        
+        symbol_df = results[sym]['df']
+        base_price = results[sym]['price_stats']['latest_price']
+        
+        for c, vk in enumerate(vol_keys, start=2):
             vol = results[sym]['volatility_metrics'][vk]
-            price = base_price + (vol * base_price)
-            ws.cell(row=row, column=c, value=_fmt_price(price)).alignment = center
+            target_price = base_price + (vol * base_price)  # Buy target (base + slippage)
+            
+            max_volume = calculate_max_investment_volume(symbol_df, target_price, 'buy')
+            ws.cell(row=row, column=c, value=_fmt_volume(max_volume)).alignment = center
+        
         row += 1
 
     row += 2
 
-    # Table 3: Sell target prices
-    ws.cell(row=row, column=1, value="3. Sell Target Prices - Base Price - Slippage").font = title_font
+    # Table 3: Sell Investment Volumes
+    ws.cell(row=row, column=1, value="3. Max Investment Volume to Sell (Absorbing Bid Levels)").font = title_font
     row += 2
 
-    ws.cell(row=row, column=1, value="Minutes").font = header_font
-    ws.cell(row=row, column=1).fill = header_fill
-    ws.cell(row=row, column=1).alignment = center
-
-    for c, sym in enumerate(symbols, start=2):
-        mean_price = results[sym]['price_stats']['mean_price']
-        ws.cell(row=row, column=c, value=f"{sym} ($ {_fmt_price(mean_price)})").font = header_font
-        ws.cell(row=row, column=c).fill = header_fill
-        ws.cell(row=row, column=c).alignment = center
+    # Headers: Symbol + time periods  
+    for c, hdr in enumerate(headers, start=1):
+        cell = ws.cell(row=row, column=c, value=hdr)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = center
     row += 1
 
-    for tl, vk in zip(time_labels, vol_keys):
-        label = "1 day" if tl=="1day" else "1 year" if tl=="1year" else tl
-        ws.cell(row=row, column=1, value=label).alignment = center
-        ws.cell(row=row, column=1).font = Font(bold=True)
-        for c, sym in enumerate(symbols, start=2):
-            base_price = results[sym]['price_stats']['latest_price']
+    # Data rows: each symbol with max investment volumes for sell targets
+    for sym in symbols:
+        ws.cell(row=row, column=1, value=sym).font = Font(bold=True)
+        ws.cell(row=row, column=1).alignment = center
+        
+        symbol_df = results[sym]['df']
+        base_price = results[sym]['price_stats']['latest_price']
+        
+        for c, vk in enumerate(vol_keys, start=2):
             vol = results[sym]['volatility_metrics'][vk]
-            price = base_price - (vol * base_price)
-            ws.cell(row=row, column=c, value=_fmt_price(price)).alignment = center
+            target_price = base_price - (vol * base_price)  # Sell target (base - slippage)
+            
+            max_volume = calculate_max_investment_volume(symbol_df, target_price, 'sell')
+            ws.cell(row=row, column=c, value=_fmt_volume(max_volume)).alignment = center
+        
         row += 1
 
     row += 2
