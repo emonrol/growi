@@ -1106,6 +1106,156 @@ def create_new_percentile_tables(results: Dict, percentiles: List[int], ws, star
     
     return current_row
 
+def create_orderbook_depth_plots(results: Dict, percentiles: List[int]) -> List[str]:
+    """
+    Create orderbook depth plots for each percentile and mean.
+    
+    Args:
+        results: Analysis results
+        percentiles: List of percentiles to plot
+    
+    Returns:
+        List of created plot filenames
+    """
+    # Get data
+    percentile_dfs = build_percentile_depth(results, percentiles)
+    mean_df = build_mean_depth(results)
+    
+    symbols = list(results.keys())
+    max_levels = 5  # Plot up to 5 levels
+    
+    # Create color palette for symbols
+    colors = plt.cm.Set1(np.linspace(0, 1, len(symbols)))
+    
+    plot_files = []
+    
+    # Create plots for each percentile
+    for perc in sorted(percentiles):
+        filename = f"orderbook_depth_p{perc:02d}.png"
+        plot_files.append(filename)
+        
+        plt.figure(figsize=(12, 8))
+        
+        pct_df = percentile_dfs[perc]
+        
+        # Plot each symbol
+        for i, symbol in enumerate(symbols):
+            color = colors[i]
+            
+            # Get ask and bid data for this symbol
+            ask_data = pct_df[(pct_df['symbol'] == symbol) & (pct_df['side'] == 'ask')].sort_values('level')
+            bid_data = pct_df[(pct_df['symbol'] == symbol) & (pct_df['side'] == 'bid')].sort_values('level')
+            
+            # Prepare ask line data
+            ask_levels = []
+            ask_values = []
+            for level in range(1, max_levels + 1):
+                level_data = ask_data[ask_data['level'] == level]
+                if len(level_data) > 0:
+                    ask_levels.append(level)
+                    value = level_data['acc_usd'].iloc[0]
+                    ask_values.append(max(value, 1) if not pd.isna(value) else 1)  # Ensure positive for log scale
+            
+            # Prepare bid line data
+            bid_levels = []
+            bid_values = []
+            for level in range(1, max_levels + 1):
+                level_data = bid_data[bid_data['level'] == level]
+                if len(level_data) > 0:
+                    bid_levels.append(level)
+                    value = level_data['acc_usd'].iloc[0]
+                    bid_values.append(max(value, 1) if not pd.isna(value) else 1)  # Ensure positive for log scale
+            
+            # Plot ask line (solid)
+            if ask_levels and ask_values:
+                plt.plot(ask_levels, ask_values, color=color, linewidth=2, linestyle='-', 
+                        label=f'{symbol} Ask', marker='o', markersize=6)
+            
+            # Plot bid line (dashed)
+            if bid_levels and bid_values:
+                plt.plot(bid_levels, bid_values, color=color, linewidth=2, linestyle='--',
+                        label=f'{symbol} Bid', marker='s', markersize=6)
+        
+        # Formatting
+        plt.yscale('log')
+        plt.xlabel('Orderbook Level', fontsize=12, fontweight='bold')
+        plt.ylabel('Accumulated USD Value (Log Scale)', fontsize=12, fontweight='bold')
+        plt.title(f'Orderbook Depth - Percentile {perc}% (Accumulated USD)', fontsize=14, fontweight='bold')
+        plt.grid(True, alpha=0.3, which='both')
+        plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=10)
+        plt.xticks(range(1, max_levels + 1), [f'N{i}' for i in range(1, max_levels + 1)])
+        
+        # Format y-axis
+        ax = plt.gca()
+        ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'${x:,.0f}' if x >= 1000 else f'${x:.0f}'))
+        
+        plt.tight_layout()
+        plt.savefig(filename, dpi=300, bbox_inches='tight')
+        plt.close()
+    
+    # Create plot for mean
+    filename = "orderbook_depth_mean.png"
+    plot_files.append(filename)
+    
+    plt.figure(figsize=(12, 8))
+    
+    # Plot each symbol
+    for i, symbol in enumerate(symbols):
+        color = colors[i]
+        
+        # Get ask and bid data for this symbol
+        ask_data = mean_df[(mean_df['symbol'] == symbol) & (mean_df['side'] == 'ask')].sort_values('level')
+        bid_data = mean_df[(mean_df['symbol'] == symbol) & (mean_df['side'] == 'bid')].sort_values('level')
+        
+        # Prepare ask line data
+        ask_levels = []
+        ask_values = []
+        for level in range(1, max_levels + 1):
+            level_data = ask_data[ask_data['level'] == level]
+            if len(level_data) > 0:
+                ask_levels.append(level)
+                value = level_data['acc_usd'].iloc[0]
+                ask_values.append(max(value, 1) if not pd.isna(value) else 1)  # Ensure positive for log scale
+        
+        # Prepare bid line data
+        bid_levels = []
+        bid_values = []
+        for level in range(1, max_levels + 1):
+            level_data = bid_data[bid_data['level'] == level]
+            if len(level_data) > 0:
+                bid_levels.append(level)
+                value = level_data['acc_usd'].iloc[0]
+                bid_values.append(max(value, 1) if not pd.isna(value) else 1)  # Ensure positive for log scale
+        
+        # Plot ask line (solid)
+        if ask_levels and ask_values:
+            plt.plot(ask_levels, ask_values, color=color, linewidth=2, linestyle='-',
+                    label=f'{symbol} Ask', marker='o', markersize=6)
+        
+        # Plot bid line (dashed)
+        if bid_levels and bid_values:
+            plt.plot(bid_levels, bid_values, color=color, linewidth=2, linestyle='--',
+                    label=f'{symbol} Bid', marker='s', markersize=6)
+    
+    # Formatting
+    plt.yscale('log')
+    plt.xlabel('Orderbook Level', fontsize=12, fontweight='bold')
+    plt.ylabel('Accumulated USD Value (Log Scale)', fontsize=12, fontweight='bold')
+    plt.title('Orderbook Depth - Mean Values (Accumulated USD)', fontsize=14, fontweight='bold')
+    plt.grid(True, alpha=0.3, which='both')
+    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=10)
+    plt.xticks(range(1, max_levels + 1), [f'N{i}' for i in range(1, max_levels + 1)])
+    
+    # Format y-axis
+    ax = plt.gca()
+    ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'${x:,.0f}' if x >= 1000 else f'${x:.0f}'))
+    
+    plt.tight_layout()
+    plt.savefig(filename, dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    return plot_files
+
 def create_excel_tables(results: Dict, percentiles: List[int], output_filename: str = EXCEL_FILENAME) -> None:
     workbook = openpyxl.Workbook()
     ws = workbook.active
@@ -1244,33 +1394,6 @@ def create_excel_tables(results: Dict, percentiles: List[int], output_filename: 
 
     row += 2
 
-    # Table 4: Leverage Information
-    ws.cell(row=row, column=1, value="4. Leverage Information").font = title_font
-    row += 2
-
-    headers = ["Symbol", "Leverage Tiers"]
-    for c, hdr in enumerate(headers, start=1):
-        cell = ws.cell(row=row, column=c, value=hdr)
-        cell.font = header_font
-        cell.fill = header_fill
-        cell.alignment = center
-    row += 1
-
-    for sym in symbols:
-        lev_info = results[sym]['leverage_info']
-        
-        ws.cell(row=row, column=1, value=sym).alignment = center
-        ws.cell(row=row, column=1).font = Font(bold=True)
-        ws.cell(row=row, column=1).fill = leverage_fill
-        
-        tiers_text = "; ".join([f"{lb} → {lev}" for lb, lev in lev_info['tiers_formatted']]) if lev_info['tiers_formatted'] else "N/A"
-        ws.cell(row=row, column=2, value=tiers_text).alignment = Alignment(horizontal="left", vertical="center")
-        ws.cell(row=row, column=2).fill = leverage_fill
-        
-        row += 1
-
-    row += 2
-
     # New Percentile Tables (replaces the old ones and includes means)
     row = create_new_percentile_tables(results, percentiles, ws, row)
 
@@ -1351,6 +1474,9 @@ def main():
         
         chart_files.extend([token_chart, usd_chart])
     
+    print("Creating orderbook depth plots...")
+    depth_plot_files = create_orderbook_depth_plots(results, args.percentiles)
+    
     print("\n=== OUTPUT FILES ===")
     for path in csv_paths:
         print(f"{path}")
@@ -1360,6 +1486,12 @@ def main():
     print("\n=== TIME SERIES CHARTS ===")
     for chart_file in chart_files:
         print(f"{chart_file}")
+    
+    print("\n=== ORDERBOOK DEPTH PLOTS ===")
+    for depth_plot in depth_plot_files:
+        print(f"{depth_plot}")
+    
+    print(f"\nTotal files created: {len(csv_paths)} CSVs, 1 Excel, 1 leverage chart, {len(chart_files)} time series charts, {len(depth_plot_files)} depth plots")
 
 if __name__ == "__main__":
     main()
