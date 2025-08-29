@@ -33,6 +33,7 @@ import pandas as pd
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
+from openpyxl.drawing.image import Image
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import seaborn as sns
@@ -1419,9 +1420,43 @@ def create_excel_tables(results: Dict, percentiles: List[int], output_filename: 
     # New Percentile Tables (replaces the old ones and includes means)
     row = create_new_percentile_tables(results, percentiles, ws, row)
 
+    # Add orderbook depth plots
+    row += 3
+    ws.cell(row=row, column=1, value="8. Orderbook Depth Analysis Plots").font = title_font
+    row += 2
+
+    # Create the plots first (they need to exist as files to be inserted)
+    depth_plot_files = create_orderbook_depth_plots(results, percentiles)
+    
+    # Insert each plot into the Excel sheet
+    plot_row = row
+    plots_per_row = 2  # Number of plots per row
+    plot_width_cells = 15  # Width in Excel columns
+    plot_height_cells = 25  # Height in Excel rows
+    
+    for i, plot_file in enumerate(depth_plot_files):
+        if Path(plot_file).exists():
+            # Calculate position
+            plot_col = 1 + (i % plots_per_row) * (plot_width_cells + 1)
+            current_plot_row = plot_row + (i // plots_per_row) * (plot_height_cells + 2)
+            
+            # Add plot title
+            plot_name = plot_file.replace('.png', '').replace('orderbook_depth_', '').upper()
+            ws.cell(row=current_plot_row, column=plot_col, value=f"Plot: {plot_name}").font = Font(bold=True, size=12)
+            
+            # Insert image
+            img = Image(plot_file)
+            # Resize image to fit well in Excel (adjust these values as needed)
+            img.width = 600  # pixels
+            img.height = 400  # pixels
+            
+            # Position image
+            img.anchor = f"{get_column_letter(plot_col)}{current_plot_row + 1}"
+            ws.add_image(img)
+
     # Column widths - increased for more columns
     ws.column_dimensions['A'].width = 12
-    for c in range(2, len(symbols) + 50):  # More columns due to mean data
+    for c in range(2, len(symbols) + 50):  # More columns due to mean data and plots
         ws.column_dimensions[get_column_letter(c)].width = 12
 
     workbook.save(output_filename)
@@ -1475,7 +1510,7 @@ def main():
     print("Creating percentile depth tables...")
     csv_paths = save_percentile_depth_csvs(results, args.percentiles)
     
-    print("Creating Excel tables...")
+    print("Creating Excel tables with embedded plots...")
     create_excel_tables(results, args.percentiles, output_filename=EXCEL_FILENAME)
     
     print("Extracting median USD data and creating leverage chart...")
@@ -1496,24 +1531,24 @@ def main():
         
         chart_files.extend([token_chart, usd_chart])
     
-    print("Creating orderbook depth plots...")
-    depth_plot_files = create_orderbook_depth_plots(results, args.percentiles)
-    
     print("\n=== OUTPUT FILES ===")
     for path in csv_paths:
         print(f"{path}")
-    print(f"{EXCEL_FILENAME}")
+    print(f"{EXCEL_FILENAME} (includes embedded orderbook depth plots)")
     print(f"{CHART_FILENAME}")
     
     print("\n=== TIME SERIES CHARTS ===")
     for chart_file in chart_files:
         print(f"{chart_file}")
     
-    print("\n=== ORDERBOOK DEPTH PLOTS ===")
-    for depth_plot in depth_plot_files:
-        print(f"{depth_plot}")
+    # Note about embedded plots
+    print(f"\n=== EMBEDDED PLOTS IN EXCEL ===")
+    percentile_names = [f"p{p:02d}" for p in sorted(args.percentiles)] + ["mean"]
+    for plot_name in percentile_names:
+        print(f"Orderbook depth plot: {plot_name.upper()} (embedded in Excel)")
     
-    print(f"\nTotal files created: {len(csv_paths)} CSVs, 1 Excel, 1 leverage chart, {len(chart_files)} time series charts, {len(depth_plot_files)} depth plots")
+    total_separate_files = len(csv_paths) + 1 + 1 + len(chart_files)  # CSVs + Excel + leverage chart + time series
+    print(f"\nTotal separate files: {total_separate_files} | Plus 5 plots embedded in Excel")
 
 if __name__ == "__main__":
     main()
