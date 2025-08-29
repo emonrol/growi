@@ -1023,27 +1023,57 @@ def create_excel_tables(results: Dict, percentiles: List[int], output_filename: 
     ws.cell(row=row, column=1, value="NOTE: All percentage values are numbers without % symbol for Excel editing").font = Font(italic=True, size=10, color="666666")
     row += 2
 
-    # Table 1: Volatility Analysis
-    ws.cell(row=row, column=1, value="1. Volatility Analysis - Delta Percentages").font = title_font
+    # Table 1: Volatility Analysis (Transposed with Leverage Info)
+    ws.cell(row=row, column=1, value="1. Volatility Analysis - Delta Percentages + Leverage Info").font = title_font
     row += 2
 
-    ws.cell(row=row, column=1, value="Minutes").font = header_font
-    ws.cell(row=row, column=1).fill = header_fill
-    ws.cell(row=row, column=1).alignment = center
-
-    for c, sym in enumerate(symbols, start=2):
-        ws.cell(row=row, column=c, value=f"{sym} (% values)").font = header_font
-        ws.cell(row=row, column=c).fill = header_fill
-        ws.cell(row=row, column=c).alignment = center
+    # Headers: Symbol + time periods + leverage columns
+    headers = ["Symbol"] + [("1 day" if tl=="1day" else "1 year" if tl=="1year" else tl) for tl in time_labels] + ["Real Max Leverage", "Max Quantity", "Second Leverage"]
+    
+    for c, hdr in enumerate(headers, start=1):
+        cell = ws.cell(row=row, column=c, value=hdr)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = center
     row += 1
 
-    for tl, vk in zip(time_labels, vol_keys):
-        label = "1 day" if tl=="1day" else "1 year" if tl=="1year" else tl
-        ws.cell(row=row, column=1, value=label).alignment = center
-        ws.cell(row=row, column=1).font = Font(bold=True)
-        for c, sym in enumerate(symbols, start=2):
+    # Data rows: each symbol with its volatility values + leverage info
+    for sym in symbols:
+        ws.cell(row=row, column=1, value=sym).font = Font(bold=True)
+        ws.cell(row=row, column=1).alignment = center
+        
+        # Volatility data
+        for c, vk in enumerate(vol_keys, start=2):
             v = results[sym]['volatility_metrics'][vk]
             ws.cell(row=row, column=c, value=round(v*100, 3)).alignment = center
+        
+        # Leverage data
+        lev_info = results[sym]['leverage_info']
+        tiers = lev_info.get('tiers', [])
+        
+        # Real Max Leverage
+        real_max_lev = lev_info.get('max_leverage', 0)
+        ws.cell(row=row, column=len(headers)-2, value=real_max_lev).alignment = center
+        
+        # Max Quantity and Second Leverage (for multi-tier systems)
+        if len(tiers) >= 2:
+            # Multi-tier system
+            max_quantity = tiers[0][1]  # Upper bound of first tier
+            second_leverage = tiers[1][2]  # Leverage of second tier
+            
+            # Format max quantity
+            if max_quantity == float('inf'):
+                max_qty_str = "N/A"
+            else:
+                max_qty_str = f"${max_quantity:,.0f}"
+            
+            ws.cell(row=row, column=len(headers)-1, value=max_qty_str).alignment = center
+            ws.cell(row=row, column=len(headers), value=second_leverage).alignment = center
+        else:
+            # Single tier system
+            ws.cell(row=row, column=len(headers)-1, value="N/A").alignment = center
+            ws.cell(row=row, column=len(headers), value="N/A").alignment = center
+        
         row += 1
 
     row += 2
