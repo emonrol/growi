@@ -732,15 +732,37 @@ def calculate_max_investment_volume(symbol_df: pd.DataFrame, target_price: float
     if side == 'buy':
         # For buying, we want asks sorted by price (ascending)
         levels = sorted(levels, key=lambda x: float(x['px']))
-        # Check if target is reachable
-        if target_price < float(levels[0]['px']):
-            return 0.0
+        first_ask_price = float(levels[0]['px'])
+        first_ask_size = float(levels[0]['sz'])
+        
+        # If target falls below first ask level, interpolate backwards
+        if target_price < first_ask_price:
+            # Interpolate between base_price (volume=0) and first_ask_price (volume=first_ask_size)
+            if target_price <= base_price:
+                return 0.0
+            
+            price_range = first_ask_price - base_price
+            target_offset = target_price - base_price
+            interpolation_factor = target_offset / price_range if price_range > 0 else 0
+            interpolated_size = first_ask_size * interpolation_factor
+            return target_price * interpolated_size
     else:
         # For selling, we want bids sorted by price (descending)
         levels = sorted(levels, key=lambda x: float(x['px']), reverse=True)
-        # Check if target is reachable
-        if target_price > float(levels[0]['px']):
-            return 0.0
+        first_bid_price = float(levels[0]['px'])
+        first_bid_size = float(levels[0]['sz'])
+        
+        # If target falls above first bid level, interpolate backwards
+        if target_price > first_bid_price:
+            # Interpolate between base_price (volume=0) and first_bid_price (volume=first_bid_size)
+            if target_price >= base_price:
+                return 0.0
+                
+            price_range = base_price - first_bid_price
+            target_offset = base_price - target_price
+            interpolation_factor = target_offset / price_range if price_range > 0 else 0
+            interpolated_size = first_bid_size * interpolation_factor
+            return target_price * interpolated_size
     
     # Accumulate volume level by level
     prev_price = None
