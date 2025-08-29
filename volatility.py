@@ -599,43 +599,68 @@ def create_new_percentile_tables(results: Dict, percentiles: List[int], ws, star
                 col += 1
         current_row += 1
     current_row += 3
-    ws.cell(row=current_row, column=1, value='7. Summary - Average Spread Distances (Percentiles + Means)').font = title_font
+    # Table C: Spread Distances (Percentiles + Mean, side by side)
+    ws.cell(row=current_row, column=1, value="7. Spread Distances by Percentile + Mean").font = title_font
     current_row += 2
-    headers = ['Token', 'Level', 'Avg Delta Ask % (Percentiles)', 'Avg Delta Bid % (Percentiles)', 'Avg Delta Ask % (Mean)', 'Avg Delta Bid % (Mean)']
+
+    # Build header
+    headers = ["Token", "Level"]
+    for perc in percentiles:
+        headers.append(f"Ask Δ% (p{perc})")
+        headers.append(f"Bid Δ% (p{perc})")
+    headers.append("Ask Δ% (mean)")
+    headers.append("Bid Δ% (mean)")
+
     for c, hdr in enumerate(headers, start=1):
         cell = ws.cell(row=current_row, column=c, value=hdr)
         cell.font = header_font
-        if 'Mean' in hdr:
+        if "mean" in hdr:
             cell.fill = mean_header_fill
         else:
             cell.fill = header_fill
         cell.alignment = center
     current_row += 1
+
+    # Fill rows
     for symbol in symbols:
         for level in range(1, max_levels.get(symbol, overall_max_level) + 1):
-            ask_spreads_pct = []
-            bid_spreads_pct = []
+            col = 1
+            ws.cell(row=current_row, column=col, value=symbol).alignment = center
+            col += 1
+            ws.cell(row=current_row, column=col, value=f"N{level}").alignment = center
+            col += 1
+
+            # Percentiles
             for perc in percentiles:
                 pct_df = percentile_dfs[perc]
-                ask_data = pct_df[(pct_df['symbol'] == symbol) & (pct_df['side'] == 'ask') & (pct_df['level'] == level)]
-                if len(ask_data) > 0 and (not pd.isna(ask_data['spread_distance'].iloc[0])):
-                    ask_spreads_pct.append(ask_data['spread_distance'].iloc[0])
-                bid_data = pct_df[(pct_df['symbol'] == symbol) & (pct_df['side'] == 'bid') & (pct_df['level'] == level)]
-                if len(bid_data) > 0 and (not pd.isna(bid_data['spread_distance'].iloc[0])):
-                    bid_spreads_pct.append(bid_data['spread_distance'].iloc[0])
-            ask_data_mean = mean_df[(mean_df['symbol'] == symbol) & (mean_df['side'] == 'ask') & (mean_df['level'] == level)]
-            bid_data_mean = mean_df[(mean_df['symbol'] == symbol) & (mean_df['side'] == 'bid') & (mean_df['level'] == level)]
-            ask_spread_mean = ask_data_mean['spread_distance'].iloc[0] if len(ask_data_mean) > 0 and (not pd.isna(ask_data_mean['spread_distance'].iloc[0])) else np.nan
-            bid_spread_mean = bid_data_mean['spread_distance'].iloc[0] if len(bid_data_mean) > 0 and (not pd.isna(bid_data_mean['spread_distance'].iloc[0])) else np.nan
-            avg_ask_pct = np.mean(ask_spreads_pct) if ask_spreads_pct else np.nan
-            avg_bid_pct = np.mean(bid_spreads_pct) if bid_spreads_pct else np.nan
-            ws.cell(row=current_row, column=1, value=symbol).alignment = center
-            ws.cell(row=current_row, column=2, value=f'N{level}').alignment = center
-            ws.cell(row=current_row, column=3, value=round(avg_ask_pct, 3) if not np.isnan(avg_ask_pct) else 'N/A').alignment = center
-            ws.cell(row=current_row, column=4, value=round(avg_bid_pct, 3) if not np.isnan(avg_bid_pct) else 'N/A').alignment = center
-            ws.cell(row=current_row, column=5, value=round(ask_spread_mean, 3) if not np.isnan(ask_spread_mean) else 'N/A').alignment = center
-            ws.cell(row=current_row, column=6, value=round(bid_spread_mean, 3) if not np.isnan(bid_spread_mean) else 'N/A').alignment = center
+                ask_val = pct_df.loc[(pct_df['symbol'] == symbol) &
+                                     (pct_df['side'] == 'ask') &
+                                     (pct_df['level'] == level), 'spread_distance']
+                bid_val = pct_df.loc[(pct_df['symbol'] == symbol) &
+                                     (pct_df['side'] == 'bid') &
+                                     (pct_df['level'] == level), 'spread_distance']
+                ask_val = round(ask_val.iloc[0], 3) if len(ask_val) > 0 and not pd.isna(ask_val.iloc[0]) else "N/A"
+                bid_val = round(bid_val.iloc[0], 3) if len(bid_val) > 0 and not pd.isna(bid_val.iloc[0]) else "N/A"
+                ws.cell(row=current_row, column=col, value=ask_val).alignment = center
+                col += 1
+                ws.cell(row=current_row, column=col, value=bid_val).alignment = center
+                col += 1
+
+            # Mean values
+            ask_val = mean_df.loc[(mean_df['symbol'] == symbol) &
+                                  (mean_df['side'] == 'ask') &
+                                  (mean_df['level'] == level), 'spread_distance']
+            bid_val = mean_df.loc[(mean_df['symbol'] == symbol) &
+                                  (mean_df['side'] == 'bid') &
+                                  (mean_df['level'] == level), 'spread_distance']
+            ask_val = round(ask_val.iloc[0], 3) if len(ask_val) > 0 and not pd.isna(ask_val.iloc[0]) else "N/A"
+            bid_val = round(bid_val.iloc[0], 3) if len(bid_val) > 0 and not pd.isna(bid_val.iloc[0]) else "N/A"
+            ws.cell(row=current_row, column=col, value=ask_val).alignment = center
+            col += 1
+            ws.cell(row=current_row, column=col, value=bid_val).alignment = center
+
             current_row += 1
+
     return current_row
 
 def create_orderbook_depth_plots(results: Dict, percentiles: List[int]) -> List[str]:
