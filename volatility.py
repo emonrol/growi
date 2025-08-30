@@ -340,89 +340,161 @@ def build_mean_depth(results: Dict) -> pd.DataFrame:
         df = df.sort_values(['symbol', 'side', 'level']).reset_index(drop=True)
     return df
 
-def save_percentile_depth_csvs(results: Dict, percentiles: List[int]) -> List[Path]:
-    percentile_dfs = build_percentile_depth(results, percentiles)
-    output_paths = []
-    for perc, df in percentile_dfs.items():
-        output_csv = f'orderbook_levels_p{perc:02d}.csv'
-        out_path = Path(output_csv)
-        df_renamed = df.rename(columns={'spread_distance': f'spread_distance_p{perc:02d}', 'qty': f'qty_p{perc:02d}', 'usd': f'usd_p{perc:02d}', 'acc_qty': f'acc_qty_p{perc:02d}', 'acc_usd': f'acc_usd_p{perc:02d}'})
-        df_renamed.to_csv(out_path, index=False)
-        output_paths.append(out_path)
-    return output_paths
-
-def calculate_max_investment_volume(symbol_df: pd.DataFrame, target_price: float, side: str) -> float:
-    total_volume_usd = 0.0
-    if len(symbol_df) == 0:
-        return 0.0
-    last_row = symbol_df.iloc[-1]
-    base_price = _normalize_number(last_row['base_price'])
-    if pd.isna(base_price) or base_price <= 0:
-        return 0.0
-    orderbook_side = 'asks' if side == 'buy' else 'bids'
-    if orderbook_side not in last_row or pd.isna(last_row[orderbook_side]):
-        return 0.0
-    try:
-        levels = parse_orderbook_blob(last_row[orderbook_side])
-    except Exception:
-        return 0.0
-    if not levels:
-        return 0.0
-    if side == 'buy':
-        levels = sorted(levels, key=lambda x: float(x['px']))
-        first_ask_price = float(levels[0]['px'])
-        first_ask_size = float(levels[0]['sz'])
-        if target_price < first_ask_price:
-            if target_price <= base_price:
-                return 0.0
-            price_range = first_ask_price - base_price
-            target_offset = target_price - base_price
-            interpolation_factor = target_offset / price_range if price_range > 0 else 0
-            interpolated_size = first_ask_size * interpolation_factor
-            return target_price * interpolated_size
-    else:
-        levels = sorted(levels, key=lambda x: float(x['px']), reverse=True)
-        first_bid_price = float(levels[0]['px'])
-        first_bid_size = float(levels[0]['sz'])
-        if target_price > first_bid_price:
-            if target_price >= base_price:
-                return 0.0
-            price_range = base_price - first_bid_price
-            target_offset = base_price - target_price
-            interpolation_factor = target_offset / price_range if price_range > 0 else 0
-            interpolated_size = first_bid_size * interpolation_factor
-            return target_price * interpolated_size
-    prev_price = None
-    for i, level in enumerate(levels):
-        try:
-            level_price = float(level['px'])
-            level_size = float(level['sz'])
-        except (ValueError, KeyError):
-            continue
-        if side == 'buy':
-            if level_price <= target_price:
-                total_volume_usd += level_price * level_size
-                prev_price = level_price
-            else:
-                if prev_price is not None and i > 0:
-                    price_range = level_price - prev_price
-                    target_offset = target_price - prev_price
-                    interpolation_factor = target_offset / price_range if price_range > 0 else 0
-                    interpolated_size = level_size * interpolation_factor
-                    total_volume_usd += target_price * interpolated_size
-                break
-        elif level_price >= target_price:
-            total_volume_usd += level_price * level_size
-            prev_price = level_price
-        else:
-            if prev_price is not None and i > 0:
-                price_range = prev_price - level_price
-                target_offset = prev_price - target_price
-                interpolation_factor = target_offset / price_range if price_range > 0 else 0
-                interpolated_size = level_size * interpolation_factor
-                total_volume_usd += target_price * interpolated_size
-            break
-    return total_volume_usd
+def calculate_volume_by_spread_comparison(results: Dict, percentiles: List[int], percentile_dfs: Dict, mean_df: pd.DataFrame) -> Dict:
+    """
+    Calculate investment volumes by comparing volatility % with spread distances %
+    Returns dict with structure: {percentile: {symbol: {vol_key: volume}}}
+    """
+    volume_data = {}
+    symbols = list(results.keys())
+    vol_keys = ['3min_vol', '5min_vol', '10min_vol', '30min_vol', '60min_vol', '90min_vol', '1day_vol', '1year_vol']
+    
+    # Process percentile data
+    for perc in percentiles:
+        volume_data[f'p{perc}'] = {}
+        spread_df = percentile_dfs[perc]
+        usd_df = percentile_dfs[perc]  # Use same percentile for USD values
+        
+        for symbol in symbols:
+            volume_data[f'p{perc}'][symbol] = {}
+            
+            for vol_key in vol_keys:
+                volatility_pct = results[symbol]['volatility_metrics'][vol_key] * 100.0  # Convert to percentage
+                total_volume = 0.0
+                
+                # Get spread and USD data for this symbol, sorted by level
+                symbol_spread = spread_df[spread_df['symbol'] == symbol].copy()
+                symbol_usd = usd_df[usd_df['symbol'] == symbol].copy()
+                
+                if symbol_spread.empty or symbol_usd.empty:
+                    volume_data[f'p{perc}'][symbol][vol_key] = 0.0
+                    continue
+                
+                # Get max level for this symbol
+                max_level = symbol_spread['level'].max()
+                prev_level_spread = 0.0
+                prev_level_volume = 0.0
+                
+                for level in range(1, max_level + 1):
+                    # Get spread distance (mean of ask/bid)
+                    ask_spread = symbol_spread[(symbol_spread['side'] == 'ask') & (symbol_spread['level'] == level)]
+                    bid_spread = symbol_spread[(symbol_spread['side'] == 'bid') & (symbol_spread['level'] == level)]
+                    
+                    ask_spread_val = ask_spread['spread_distance'].iloc[0] if len(ask_spread) > 0 and not pd.isna(ask_spread['spread_distance'].iloc[0]) else np.nan
+                    bid_spread_val = bid_spread['spread_distance'].iloc[0] if len(bid_spread) > 0 and not pd.isna(bid_spread['spread_distance'].iloc[0]) else np.nan
+                    
+                    if not np.isnan(ask_spread_val) and not np.isnan(bid_spread_val):
+                        level_spread = (ask_spread_val + bid_spread_val) / 2
+                    elif not np.isnan(ask_spread_val):
+                        level_spread = ask_spread_val
+                    elif not np.isnan(bid_spread_val):
+                        level_spread = bid_spread_val
+                    else:
+                        continue
+                    
+                    # Get USD volume (mean of ask/bid)
+                    ask_usd = symbol_usd[(symbol_usd['side'] == 'ask') & (symbol_usd['level'] == level)]
+                    bid_usd = symbol_usd[(symbol_usd['side'] == 'bid') & (symbol_usd['level'] == level)]
+                    
+                    ask_usd_val = ask_usd['acc_usd'].iloc[0] if len(ask_usd) > 0 and not pd.isna(ask_usd['acc_usd'].iloc[0]) else np.nan
+                    bid_usd_val = bid_usd['acc_usd'].iloc[0] if len(bid_usd) > 0 and not pd.isna(bid_usd['acc_usd'].iloc[0]) else np.nan
+                    
+                    if not np.isnan(ask_usd_val) and not np.isnan(bid_usd_val):
+                        level_volume = (ask_usd_val + bid_usd_val) / 2
+                    elif not np.isnan(ask_usd_val):
+                        level_volume = ask_usd_val
+                    elif not np.isnan(bid_usd_val):
+                        level_volume = bid_usd_val
+                    else:
+                        continue
+                    
+                    # Compare volatility with spread
+                    if volatility_pct >= level_spread:
+                        # Add this level's volume
+                        total_volume += level_volume
+                    else:
+                        # Interpolate between previous level and current level
+                        if level > 1 and prev_level_spread < volatility_pct < level_spread:
+                            spread_range = level_spread - prev_level_spread
+                            vol_offset = volatility_pct - prev_level_spread
+                            interpolation_factor = vol_offset / spread_range if spread_range > 0 else 0
+                            interpolated_volume = prev_level_volume + (level_volume - prev_level_volume) * interpolation_factor
+                            total_volume += interpolated_volume
+                        break
+                    
+                    prev_level_spread = level_spread
+                    prev_level_volume = level_volume
+                
+                volume_data[f'p{perc}'][symbol][vol_key] = total_volume
+    
+    # Process mean data
+    volume_data['mean'] = {}
+    for symbol in symbols:
+        volume_data['mean'][symbol] = {}
+        
+        for vol_key in vol_keys:
+            volatility_pct = results[symbol]['volatility_metrics'][vol_key] * 100.0
+            total_volume = 0.0
+            
+            symbol_spread = mean_df[mean_df['symbol'] == symbol].copy()
+            symbol_usd = mean_df[mean_df['symbol'] == symbol].copy()
+            
+            if symbol_spread.empty or symbol_usd.empty:
+                volume_data['mean'][symbol][vol_key] = 0.0
+                continue
+            
+            max_level = symbol_spread['level'].max()
+            prev_level_spread = 0.0
+            prev_level_volume = 0.0
+            
+            for level in range(1, max_level + 1):
+                ask_spread = symbol_spread[(symbol_spread['side'] == 'ask') & (symbol_spread['level'] == level)]
+                bid_spread = symbol_spread[(symbol_spread['side'] == 'bid') & (symbol_spread['level'] == level)]
+                
+                ask_spread_val = ask_spread['spread_distance'].iloc[0] if len(ask_spread) > 0 and not pd.isna(ask_spread['spread_distance'].iloc[0]) else np.nan
+                bid_spread_val = bid_spread['spread_distance'].iloc[0] if len(bid_spread) > 0 and not pd.isna(bid_spread['spread_distance'].iloc[0]) else np.nan
+                
+                if not np.isnan(ask_spread_val) and not np.isnan(bid_spread_val):
+                    level_spread = (ask_spread_val + bid_spread_val) / 2
+                elif not np.isnan(ask_spread_val):
+                    level_spread = ask_spread_val
+                elif not np.isnan(bid_spread_val):
+                    level_spread = bid_spread_val
+                else:
+                    continue
+                
+                ask_usd = symbol_usd[(symbol_usd['side'] == 'ask') & (symbol_usd['level'] == level)]
+                bid_usd = symbol_usd[(symbol_usd['side'] == 'bid') & (symbol_usd['level'] == level)]
+                
+                ask_usd_val = ask_usd['acc_usd'].iloc[0] if len(ask_usd) > 0 and not pd.isna(ask_usd['acc_usd'].iloc[0]) else np.nan
+                bid_usd_val = bid_usd['acc_usd'].iloc[0] if len(bid_usd) > 0 and not pd.isna(bid_usd['acc_usd'].iloc[0]) else np.nan
+                
+                if not np.isnan(ask_usd_val) and not np.isnan(bid_usd_val):
+                    level_volume = (ask_usd_val + bid_usd_val) / 2
+                elif not np.isnan(ask_usd_val):
+                    level_volume = ask_usd_val
+                elif not np.isnan(bid_usd_val):
+                    level_volume = bid_usd_val
+                else:
+                    continue
+                
+                if volatility_pct >= level_spread:
+                    total_volume += level_volume
+                else:
+                    if level > 1 and prev_level_spread < volatility_pct < level_spread:
+                        spread_range = level_spread - prev_level_spread
+                        vol_offset = volatility_pct - prev_level_spread
+                        interpolation_factor = vol_offset / spread_range if spread_range > 0 else 0
+                        interpolated_volume = prev_level_volume + (level_volume - prev_level_volume) * interpolation_factor
+                        total_volume += interpolated_volume
+                    break
+                
+                prev_level_spread = level_spread
+                prev_level_volume = level_volume
+            
+            volume_data['mean'][symbol][vol_key] = total_volume
+    
+    return volume_data
 
 def get_date_range_info(results: Dict) -> Dict:
     all_timestamps = []
@@ -871,41 +943,54 @@ def create_excel_tables(results: Dict, percentiles: List[int], output_filename: 
     table4_end = row - 1
     row += 2
 
-    # Table 5: Combined Investment Volumes (Minimum of Buy/Sell)
-    ws.cell(row=row, column=1, value='5. Max Investment Volume - Minimum of Buy/Sell').font = title_font
-    table5_start = row + 1
-    row += 2
-    headers = ['Symbol'] + ['1 day' if tl == '1day' else '1 year' if tl == '1year' else tl for tl in time_labels]
-    for c, hdr in enumerate(headers, start=1):
-        cell = ws.cell(row=row, column=c, value=hdr)
-        cell.font = header_font
-        cell.fill = header_fill
-        cell.alignment = center
+    # Calculate volume data using new approach
+    volume_data = calculate_volume_by_spread_comparison(results, percentiles, percentile_dfs, mean_df)
+    
+    time_labels = ['3min', '5min', '10min', '30min', '60min', '90min', '1day', '1year']
+    vol_keys = ['3min_vol', '5min_vol', '10min_vol', '30min_vol', '60min_vol', '90min_vol', '1day_vol', '1year_vol']
+    
+    table_starts = []
+    table_ends = []
+    
+    # Create 5 separate volume tables
+    volume_tables = [f'p{p}' for p in percentiles] + ['mean']
+    
+    for i, table_key in enumerate(volume_tables):
+        table_num = 5 + i
+        ws.cell(row=row, column=1, value=f'{table_num}. Max Investment Volume - {table_key.upper()}').font = title_font
+        table_start = row + 1
+        table_starts.append(table_start)
+        row += 2
+        
+        headers = ['Symbol'] + ['1 day' if tl == '1day' else '1 year' if tl == '1year' else tl for tl in time_labels]
+        for c, hdr in enumerate(headers, start=1):
+            cell = ws.cell(row=row, column=c, value=hdr)
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = center
+        row += 1
+        
+        for sym in symbols:
+            ws.cell(row=row, column=1, value=sym).font = Font(bold=True)
+            ws.cell(row=row, column=1).alignment = center
+            
+            for c, vk in enumerate(vol_keys, start=2):
+                volume = volume_data[table_key][sym][vk]
+                cell = ws.cell(row=row, column=c, value=volume if volume > 0 else None)
+                cell.alignment = center
+                if volume > 0:
+                    cell.style = currency_style
+            row += 1
+        
+        table_end = row - 1
+        table_ends.append(table_end)
+        row += 2
+    
     row += 1
     
-    for sym in symbols:
-        ws.cell(row=row, column=1, value=sym).font = Font(bold=True)
-        ws.cell(row=row, column=1).alignment = center
-        symbol_df = results[sym]['df']
-        base_price = results[sym]['price_stats']['latest_price']
-        for c, vk in enumerate(vol_keys, start=2):
-            vol = results[sym]['volatility_metrics'][vk]
-            target_price_buy = base_price + vol * base_price
-            target_price_sell = base_price - vol * base_price
-            max_volume_buy = calculate_max_investment_volume(symbol_df, target_price_buy, 'buy')
-            max_volume_sell = calculate_max_investment_volume(symbol_df, target_price_sell, 'sell')
-            min_volume = min(max_volume_buy, max_volume_sell) if max_volume_buy > 0 and max_volume_sell > 0 else max(max_volume_buy, max_volume_sell)
-            cell = ws.cell(row=row, column=c, value=min_volume if min_volume > 0 else None)
-            cell.alignment = center
-            if min_volume > 0:
-                cell.style = currency_style
-        row += 1
-    table5_end = row - 1
-    
-    row += 3
-    
     # Create plots section
-    ws.cell(row=row, column=1, value='6. Orderbook Depth Analysis Plots').font = title_font
+    final_table_num = 5 + len(volume_tables)
+    ws.cell(row=row, column=1, value=f'{final_table_num}. Orderbook Depth Analysis Plots').font = title_font
     row += 2
     depth_plot_files = create_orderbook_depth_plots(results, percentiles)
     plot_row = row
@@ -924,13 +1009,15 @@ def create_excel_tables(results: Dict, percentiles: List[int], output_filename: 
             img.anchor = f'{get_column_letter(plot_col)}{current_plot_row + 1}'
             ws.add_image(img)
 
-    # Add grouping/outlining for tables
+    # Add grouping/outlining for tables (one at a time as requested)
     try:
         ws.row_dimensions.group(table1_start, table1_end, outline_level=1, hidden=False)
         ws.row_dimensions.group(table2_start, table2_end, outline_level=1, hidden=False)
         ws.row_dimensions.group(table3_start, table3_end, outline_level=1, hidden=False) 
         ws.row_dimensions.group(table4_start, table4_end, outline_level=1, hidden=False)
-        ws.row_dimensions.group(table5_start, table5_end, outline_level=1, hidden=False)
+        # Group each volume table individually
+        for table_start, table_end in zip(table_starts, table_ends):
+            ws.row_dimensions.group(table_start, table_end, outline_level=1, hidden=False)
     except:
         pass  # If grouping fails, continue without it
 
@@ -967,19 +1054,16 @@ def main():
     if not Path(LEVERAGE_DATA_FILE).exists():
         print(f"Warning: Leverage data file not found: {LEVERAGE_DATA_FILE}")
     results = analyze_csv(args.csv_file, args.symbols, sep=args.sep)
-    csv_paths = save_percentile_depth_csvs(results, args.percentiles)
     create_excel_tables(results, args.percentiles, output_filename=EXCEL_FILENAME)
     leverage_usd_data = extract_median_usd_from_p50(results, args.percentiles, args.chart_level)
     create_leverage_vs_usd_chart(leverage_usd_data, output_filename=CHART_FILENAME, chart_type=args.chart_type)
     time_series_data = extract_time_series_levels(results, max_levels=args.max_levels)
     chart_files = []
     for symbol in results.keys():
-        token_chart = f'token_levels_over_time_{symbol}.png'
-        usd_chart = f'usd_levels_over_time_{symbol}.png'
+        token_chart = PLOTS_DIR / f'token_levels_over_time_{symbol}.png'
+        usd_chart = PLOTS_DIR / f'usd_levels_over_time_{symbol}.png'
         create_token_levels_chart(time_series_data, symbol, token_chart, max_levels=args.max_levels)
         create_usd_levels_chart(time_series_data, symbol, usd_chart, max_levels=args.max_levels)
         chart_files.extend([token_chart, usd_chart])
-    percentile_names = [f'p{p:02d}' for p in sorted(args.percentiles)] + ['mean']
-    total_separate_files = len(csv_paths) + 1 + 1 + len(chart_files)
 if __name__ == '__main__':
     main()
