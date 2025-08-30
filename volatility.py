@@ -16,6 +16,9 @@ from API import get_leverage_info_from_file, LEVERAGE_DATA_FILE
 DEFAULT_PERCENTILES = [1, 10, 25, 50]
 EXCEL_FILENAME = 'volatility_analysis.xlsx'
 CHART_FILENAME = 'leverage_vs_usd_chart.png'
+PLOTS_DIR = Path("plots")
+PLOTS_DIR.mkdir(exist_ok=True)
+
 
 def calculate_log_returns(prices: pd.Series) -> pd.Series:
     prices = prices[prices > 0]
@@ -161,7 +164,7 @@ def create_token_levels_chart(time_series_data: Dict[str, Dict], symbol: str, ou
     if symbol not in time_series_data:
         return
     if not output_filename:
-        output_filename = f'token_levels_over_time_{symbol}.png'
+        output_filename = PLOTS_DIR / f'token_levels_over_time_{symbol}.png'
     data = time_series_data[symbol]
     timestamps = data['timestamps']
     if not timestamps:
@@ -199,7 +202,7 @@ def create_usd_levels_chart(time_series_data: Dict[str, Dict], symbol: str, outp
     if symbol not in time_series_data:
         return
     if not output_filename:
-        output_filename = f'usd_levels_over_time_{symbol}.png'
+        output_filename = PLOTS_DIR / f'usd_levels_over_time_{symbol}.png'
     data = time_series_data[symbol]
     timestamps = data['timestamps']
     if not timestamps:
@@ -671,7 +674,7 @@ def create_orderbook_depth_plots(results: Dict, percentiles: List[int]) -> List[
     colors = plt.cm.Set1(np.linspace(0, 1, len(symbols)))
     plot_files = []
     for perc in sorted(percentiles):
-        filename = f'orderbook_depth_p{perc:02d}.png'
+        filename = PLOTS_DIR / f'orderbook_depth_p{perc:02d}.png'
         plot_files.append(filename)
         plt.figure(figsize=(12, 8))
         pct_df = percentile_dfs[perc]
@@ -711,7 +714,7 @@ def create_orderbook_depth_plots(results: Dict, percentiles: List[int]) -> List[
         plt.tight_layout()
         plt.savefig(filename, dpi=300, bbox_inches='tight')
         plt.close()
-    filename = 'orderbook_depth_mean.png'
+    filename = PLOTS_DIR / 'orderbook_depth_mean.png'
     plot_files.append(filename)
     plt.figure(figsize=(12, 8))
     for i, symbol in enumerate(symbols):
