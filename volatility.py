@@ -299,7 +299,8 @@ def _mean(series: List[float]) -> float:
 def build_percentile_depth(results: Dict, percentiles: List[int]) -> Dict[int, pd.DataFrame]:
     percentile_dfs = {}
     for perc in percentiles:
-        q = (100 - perc) / 100.0  # Fix percentile interpretation
+        q_spread = (100 - perc) / 100.0  # Inverted for spread distances (p1 = 99% spreads are ≤ this)
+        q_volume = perc / 100.0  # Normal for volumes (p1 = 99% times there will be AT LEAST this volume)
         rows = []
         for symbol, blob in results.items():
             sdf = blob['df']
@@ -308,7 +309,9 @@ def build_percentile_depth(results: Dict, percentiles: List[int]) -> Dict[int, p
                 acc_qty = acc_usd = 0.0
                 for lvl in sorted(buckets.keys()):
                     b = buckets[lvl]
-                    spread_p, qty_p, usd_p = (_percentile(b['spread_distance'], q), _percentile(b['qty'], q), _percentile(b['usd'], q))
+                    spread_p = _percentile(b['spread_distance'], q_spread)
+                    qty_p = _percentile(b['qty'], q_volume) 
+                    usd_p = _percentile(b['usd'], q_volume)
                     if not np.isnan(qty_p):
                         acc_qty += qty_p
                     if not np.isnan(usd_p):
@@ -374,6 +377,7 @@ def calculate_volume_by_spread_comparison(results: Dict, percentiles: List[int],
                 max_level = symbol_spread['level'].max()
                 prev_level_spread = 0.0
                 prev_level_volume = 0.0
+                first_level_processed = False
                 
                 for level in range(1, max_level + 1):
                     # Get spread distance (mean of ask/bid)
@@ -408,19 +412,32 @@ def calculate_volume_by_spread_comparison(results: Dict, percentiles: List[int],
                     else:
                         continue
                     
-                    # Compare volatility with spread
-                    if volatility_pct >= level_spread:
-                        # Add this level's volume
-                        total_volume += level_volume
+                    # Special handling for first level - interpolate from 0 if volatility < first_level_spread
+                    if level == 1 and not first_level_processed:
+                        if volatility_pct < level_spread:
+                            # Interpolate between 0 and first level volume
+                            interpolation_factor = volatility_pct / level_spread if level_spread > 0 else 0
+                            total_volume += level_volume * interpolation_factor
+                            first_level_processed = True
+                            break
+                        else:
+                            # Add full first level volume
+                            total_volume += level_volume
+                            first_level_processed = True
                     else:
-                        # Interpolate between previous level and current level
-                        if level > 1 and prev_level_spread < volatility_pct < level_spread:
-                            spread_range = level_spread - prev_level_spread
-                            vol_offset = volatility_pct - prev_level_spread
-                            interpolation_factor = vol_offset / spread_range if spread_range > 0 else 0
-                            interpolated_volume = prev_level_volume + (level_volume - prev_level_volume) * interpolation_factor
-                            total_volume += interpolated_volume
-                        break
+                        # Compare volatility with spread for levels > 1
+                        if volatility_pct >= level_spread:
+                            # Add this level's volume
+                            total_volume += level_volume
+                        else:
+                            # Interpolate between previous level and current level
+                            if level > 1 and prev_level_spread < volatility_pct < level_spread:
+                                spread_range = level_spread - prev_level_spread
+                                vol_offset = volatility_pct - prev_level_spread
+                                interpolation_factor = vol_offset / spread_range if spread_range > 0 else 0
+                                interpolated_volume = prev_level_volume + (level_volume - prev_level_volume) * interpolation_factor
+                                total_volume += interpolated_volume
+                            break
                     
                     prev_level_spread = level_spread
                     prev_level_volume = level_volume
@@ -446,6 +463,7 @@ def calculate_volume_by_spread_comparison(results: Dict, percentiles: List[int],
             max_level = symbol_spread['level'].max()
             prev_level_spread = 0.0
             prev_level_volume = 0.0
+            first_level_processed = False
             
             for level in range(1, max_level + 1):
                 ask_spread = symbol_spread[(symbol_spread['side'] == 'ask') & (symbol_spread['level'] == level)]
@@ -478,16 +496,27 @@ def calculate_volume_by_spread_comparison(results: Dict, percentiles: List[int],
                 else:
                     continue
                 
-                if volatility_pct >= level_spread:
-                    total_volume += level_volume
+                # Special handling for first level
+                if level == 1 and not first_level_processed:
+                    if volatility_pct < level_spread:
+                        interpolation_factor = volatility_pct / level_spread if level_spread > 0 else 0
+                        total_volume += level_volume * interpolation_factor
+                        first_level_processed = True
+                        break
+                    else:
+                        total_volume += level_volume
+                        first_level_processed = True
                 else:
-                    if level > 1 and prev_level_spread < volatility_pct < level_spread:
-                        spread_range = level_spread - prev_level_spread
-                        vol_offset = volatility_pct - prev_level_spread
-                        interpolation_factor = vol_offset / spread_range if spread_range > 0 else 0
-                        interpolated_volume = prev_level_volume + (level_volume - prev_level_volume) * interpolation_factor
-                        total_volume += interpolated_volume
-                    break
+                    if volatility_pct >= level_spread:
+                        total_volume += level_volume
+                    else:
+                        if level > 1 and prev_level_spread < volatility_pct < level_spread:
+                            spread_range = level_spread - prev_level_spread
+                            vol_offset = volatility_pct - prev_level_spread
+                            interpolation_factor = vol_offset / spread_range if spread_range > 0 else 0
+                            interpolated_volume = prev_level_volume + (level_volume - prev_level_volume) * interpolation_factor
+                            total_volume += interpolated_volume
+                        break
                 
                 prev_level_spread = level_spread
                 prev_level_volume = level_volume
