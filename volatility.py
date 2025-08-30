@@ -1056,7 +1056,7 @@ def main():
     results = analyze_csv(args.csv_file, args.symbols, sep=args.sep)
     create_excel_tables(results, args.percentiles, output_filename=EXCEL_FILENAME)
     leverage_usd_data = extract_median_usd_from_p50(results, args.percentiles, args.chart_level)
-    create_leverage_vs_usd_chart(leverage_usd_data, output_filename=CHART_FILENAME, chart_type=args.chart_type)
+    create_leverage_vs_usd_chart(leverage_usd_data, output_filename=PLOTS_DIR / CHART_FILENAME, chart_type=args.chart_type)
     time_series_data = extract_time_series_levels(results, max_levels=args.max_levels)
     chart_files = []
     for symbol in results.keys():
