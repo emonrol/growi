@@ -9,8 +9,6 @@ from openpyxl.styles import Font, PatternFill, Alignment, NamedStyle
 from openpyxl.utils import get_column_letter
 from openpyxl.drawing.image import Image
 import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
-from scipy import stats
 sys.path.append('/home/eric/Documents/growi')
 from orderbook_utils import parse_orderbook_blob, validate_required_columns, REQUIRED_CSV_COLUMNS, _normalize_number
 from API import get_leverage_info_from_file, LEVERAGE_DATA_FILE
@@ -31,16 +29,46 @@ def calculate_volatility_metrics(log_returns: pd.Series) -> Dict[str, float]:
     vol_5min = log_returns.std()
     return {'3min_vol': vol_5min * np.sqrt(3 / 5), '5min_vol': vol_5min, '10min_vol': vol_5min * np.sqrt(10 / 5), '30min_vol': vol_5min * np.sqrt(30 / 5), '60min_vol': vol_5min * np.sqrt(60 / 5), '90min_vol': vol_5min * np.sqrt(90 / 5), '1day_vol': vol_5min * np.sqrt(1440 / 5), '1year_vol': vol_5min * np.sqrt(525600 / 5), 'sample_size': len(log_returns), 'mean_return': log_returns.mean()}
 
+def add_summary_statistics_volume(ws, data_dict: Dict, start_row: int, col_start: int = 2) -> int:
+    symbols = list(data_dict.keys())
+    if not symbols:
+        return start_row
+    
+    vol_keys = ['3min_vol', '5min_vol', '10min_vol', '30min_vol', '60min_vol', '90min_vol', '1day_vol', '1year_vol']
+    quantile_labels = ['Min', '25%', '50%', '75%', 'Max', 'Mean']
+    
+    for i, label in enumerate(quantile_labels):
+        row = start_row + i
+        cell = ws.cell(row=row, column=1, value=label)
+        cell.font = Font(bold=True, color='0066CC')
+        cell.alignment = Alignment(horizontal='center', vertical='center')
+        
+        for col_idx, vol_key in enumerate(vol_keys):
+            col = col_start + col_idx
+            
+            values = [data_dict[sym][vol_key] for sym in symbols if vol_key in data_dict[sym] and data_dict[sym][vol_key] > 0]
+            
+            if values:
+                if label == 'Min':
+                    stat_val = min(values)
+                elif label == '25%':
+                    stat_val = np.percentile(values, 25)
+                elif label == '50%':
+                    stat_val = np.percentile(values, 50)
+                elif label == '75%':
+                    stat_val = np.percentile(values, 75)
+                elif label == 'Max':
+                    stat_val = max(values)
+                elif label == 'Mean':
+                    stat_val = np.mean(values)
+                
+                cell = ws.cell(row=row, column=col, value=stat_val)
+                cell.alignment = Alignment(horizontal='center', vertical='center')
+                cell.style = 'currency'
+    
+    return start_row + len(quantile_labels)
 def fetch_leverage_info(symbol: str) -> Dict:
     return get_leverage_info_from_file(symbol, LEVERAGE_DATA_FILE)
-
-def get_effective_leverage_for_usd_amount(usd_amount: float, leverage_tiers: List[Tuple[float, float, int]]) -> int:
-    if not leverage_tiers:
-        return 0
-    for lower_bound, upper_bound, leverage in leverage_tiers:
-        if lower_bound <= usd_amount < upper_bound:
-            return leverage
-    return leverage_tiers[-1][2] if leverage_tiers else 0
 
 def analyze_csv(csv_path: str, symbol_filters: Optional[list]=None, sep: str=',') -> Dict:
     try:
@@ -52,8 +80,6 @@ def analyze_csv(csv_path: str, symbol_filters: Optional[list]=None, sep: str=','
         df = df[df['symbol'].isin(symbol_filters)]
         if len(df) == 0:
             raise SystemExit(f'No data found for symbols: {symbol_filters}')
-        found_symbols = df['symbol'].unique()
-        missing_symbols = set(symbol_filters) - set(found_symbols)
     if 'ts' in df.columns:
         df['ts'] = pd.to_datetime(df['ts'], format='mixed')
         df = df.sort_values('ts')
@@ -172,77 +198,78 @@ def calculate_stability_metrics(results: Dict, max_levels: int = DEFAULT_MAX_LEV
         
         stability_data[symbol] = {}
         
-        for side in ('bids', 'asks'):
-            side_name = 'bid' if side == 'bids' else 'ask'
-            stability_data[symbol][side_name] = {}
-            
-            level_qty_series = {}
-            level_usd_series = {}
-            
-            for level in range(1, max_levels + 1):
-                level_qty_series[level] = []
-                level_usd_series[level] = []
+        for level in range(1, max_levels + 1):
+            level_qty_series = []
+            level_usd_series = []
             
             for _, row in sdf.iterrows():
-                base_price = _normalize_number(row['base_price'])
+                bid_qty = bid_usd = ask_qty = ask_usd = None
                 
-                for level in range(1, max_levels + 1):
-                    level_qty_series[level].append(np.nan)
-                    level_usd_series[level].append(np.nan)
-                
-                if side in row and not pd.isna(row[side]):
+                if 'bids' in row and not pd.isna(row['bids']):
                     try:
-                        levels = parse_orderbook_blob(row[side])
-                        acc_qty = 0.0
-                        acc_usd = 0.0
-                        
-                        for i, lvl in enumerate(levels[:max_levels], start=1):
-                            try:
-                                px, sz = (float(lvl['px']), float(lvl['sz']))
-                                acc_qty += sz
-                                acc_usd += px * sz
-                                level_qty_series[i][-1] = acc_qty
-                                level_usd_series[i][-1] = acc_usd
-                            except Exception:
-                                continue
+                        bid_levels = parse_orderbook_blob(row['bids'])
+                        if level <= len(bid_levels):
+                            bid_qty = sum(float(bid_levels[i]['sz']) for i in range(level))
+                            bid_usd = sum(float(bid_levels[i]['px']) * float(bid_levels[i]['sz']) for i in range(level))
                     except Exception:
                         pass
+                
+                if 'asks' in row and not pd.isna(row['asks']):
+                    try:
+                        ask_levels = parse_orderbook_blob(row['asks'])
+                        if level <= len(ask_levels):
+                            ask_qty = sum(float(ask_levels[i]['sz']) for i in range(level))
+                            ask_usd = sum(float(ask_levels[i]['px']) * float(ask_levels[i]['sz']) for i in range(level))
+                    except Exception:
+                        pass
+                
+                # Calculate mean of bid/ask
+                if bid_qty is not None and ask_qty is not None:
+                    level_qty_series.append((bid_qty + ask_qty) / 2)
+                elif bid_qty is not None:
+                    level_qty_series.append(bid_qty)
+                elif ask_qty is not None:
+                    level_qty_series.append(ask_qty)
+                
+                if bid_usd is not None and ask_usd is not None:
+                    level_usd_series.append((bid_usd + ask_usd) / 2)
+                elif bid_usd is not None:
+                    level_usd_series.append(bid_usd)
+                elif ask_usd is not None:
+                    level_usd_series.append(ask_usd)
             
-            for level in range(1, max_levels + 1):
-                qty_series = pd.Series(level_qty_series[level]).dropna()
-                usd_series = pd.Series(level_usd_series[level]).dropna()
-                
-                qty_stats = {}
-                usd_stats = {}
-                
-                if len(qty_series) > 1:
-                    qty_stats = {
-                        'sd': qty_series.std(),
-                        'mean': qty_series.mean(),
-                        'cv': qty_series.std() / qty_series.mean() if qty_series.mean() != 0 else np.nan,
-                        'iqr': qty_series.quantile(0.75) - qty_series.quantile(0.25),
-                        'autocorr': qty_series.autocorr(lag=1) if len(qty_series) > 2 else np.nan,
-                        'count': len(qty_series)
-                    }
-                else:
-                    qty_stats = {'sd': np.nan, 'mean': np.nan, 'cv': np.nan, 'iqr': np.nan, 'autocorr': np.nan, 'count': len(qty_series)}
-                
-                if len(usd_series) > 1:
-                    usd_stats = {
-                        'sd': usd_series.std(),
-                        'mean': usd_series.mean(),
-                        'cv': usd_series.std() / usd_series.mean() if usd_series.mean() != 0 else np.nan,
-                        'iqr': usd_series.quantile(0.75) - usd_series.quantile(0.25),
-                        'autocorr': usd_series.autocorr(lag=1) if len(usd_series) > 2 else np.nan,
-                        'count': len(usd_series)
-                    }
-                else:
-                    usd_stats = {'sd': np.nan, 'mean': np.nan, 'cv': np.nan, 'iqr': np.nan, 'autocorr': np.nan, 'count': len(usd_series)}
-                
-                stability_data[symbol][side_name][level] = {
-                    'qty': qty_stats,
-                    'usd': usd_stats
+            qty_series = pd.Series(level_qty_series)
+            usd_series = pd.Series(level_usd_series)
+            
+            qty_stats = {}
+            usd_stats = {}
+            
+            if len(qty_series) > 1:
+                qty_stats = {
+                    'mean': qty_series.mean(),
+                    'sd': qty_series.std(),
+                    'cv': qty_series.std() / qty_series.mean() if qty_series.mean() != 0 else np.nan,
+                    'iqr': qty_series.quantile(0.75) - qty_series.quantile(0.25),
+                    'autocorr': qty_series.autocorr(lag=1) if len(qty_series) > 2 else np.nan,
                 }
+            else:
+                qty_stats = {'mean': np.nan, 'sd': np.nan, 'cv': np.nan, 'iqr': np.nan, 'autocorr': np.nan}
+            
+            if len(usd_series) > 1:
+                usd_stats = {
+                    'mean': usd_series.mean(),
+                    'sd': usd_series.std(),
+                    'cv': usd_series.std() / usd_series.mean() if usd_series.mean() != 0 else np.nan,
+                    'iqr': usd_series.quantile(0.75) - usd_series.quantile(0.25),
+                    'autocorr': usd_series.autocorr(lag=1) if len(usd_series) > 2 else np.nan,
+                }
+            else:
+                usd_stats = {'mean': np.nan, 'sd': np.nan, 'cv': np.nan, 'iqr': np.nan, 'autocorr': np.nan}
+            
+            stability_data[symbol][level] = {
+                'qty': qty_stats,
+                'usd': usd_stats
+            }
     
     return stability_data
 
@@ -331,6 +358,7 @@ def calculate_volume_by_spread_comparison(results: Dict, percentiles: List[int],
                 
                 volume_data[f'p{perc}'][symbol][vol_key] = total_volume
     
+    # Mean calculation
     volume_data['mean'] = {}
     for symbol in symbols:
         volume_data['mean'][symbol] = {}
@@ -433,8 +461,23 @@ def get_date_range_info(results: Dict) -> Dict:
         'num_days': num_days
     }
 
+def sort_symbols_by_volatility(results: Dict) -> List[str]:
+    symbols = list(results.keys())
+    
+    def has_zero_volatility(symbol):
+        vol_metrics = results[symbol]['volatility_metrics']
+        vol_keys = ['3min_vol', '5min_vol', '10min_vol', '30min_vol', '60min_vol', '90min_vol', '1day_vol', '1year_vol']
+        return all(vol_metrics.get(key, 0) == 0 for key in vol_keys)
+    
+    non_zero_symbols = [s for s in symbols if not has_zero_volatility(s)]
+    zero_symbols = [s for s in symbols if has_zero_volatility(s)]
+    
+    non_zero_symbols.sort()
+    zero_symbols.sort()
+    
+    return non_zero_symbols + zero_symbols
+
 def filter_empty_symbols(results: Dict, volume_data: Dict) -> Dict:
-    """Remove symbols that have no valid data in volume tables"""
     symbols_to_remove = set()
     
     for table_key in volume_data.keys():
@@ -454,7 +497,6 @@ def filter_empty_symbols(results: Dict, volume_data: Dict) -> Dict:
     return results
 
 def add_summary_statistics(ws, data_dict: Dict, start_row: int, col_start: int = 2) -> int:
-    """Add quantile summary rows for tables"""
     symbols = list(data_dict.keys())
     if not symbols:
         return start_row
@@ -471,10 +513,7 @@ def add_summary_statistics(ws, data_dict: Dict, start_row: int, col_start: int =
         for col_idx, vol_key in enumerate(vol_keys):
             col = col_start + col_idx
             
-            if vol_key in ['3min_vol', '5min_vol', '10min_vol', '30min_vol', '60min_vol', '90min_vol', '1day_vol', '1year_vol']:
-                values = [data_dict[sym]['volatility_metrics'][vol_key] for sym in symbols if vol_key in data_dict[sym]['volatility_metrics']]
-            else:
-                values = [data_dict[sym][vol_key] for sym in symbols if vol_key in data_dict[sym]]
+            values = [data_dict[sym]['volatility_metrics'][vol_key] for sym in symbols if vol_key in data_dict[sym]['volatility_metrics']]
             
             if values:
                 if label == 'Min':
@@ -492,8 +531,7 @@ def add_summary_statistics(ws, data_dict: Dict, start_row: int, col_start: int =
                 
                 cell = ws.cell(row=row, column=col, value=stat_val)
                 cell.alignment = Alignment(horizontal='center', vertical='center')
-                if vol_key in ['3min_vol', '5min_vol', '10min_vol', '30min_vol', '60min_vol', '90min_vol', '1day_vol', '1year_vol']:
-                    cell.style = 'percentage'
+                cell.style = 'percentage'
     
     return start_row + len(quantile_labels)
 
@@ -614,7 +652,6 @@ def create_excel_tables(results: Dict, percentiles: List[int], max_levels: int =
     if "percentage" not in workbook.named_styles:
         workbook.add_named_style(percentage_style)
 
-    symbols = list(results.keys())
     time_labels = ['3min', '5min', '10min', '30min', '60min', '90min', '1day', '1year']
     vol_keys = ['3min_vol', '5min_vol', '10min_vol', '30min_vol', '60min_vol', '90min_vol', '1day_vol', '1year_vol']
     
@@ -631,6 +668,15 @@ def create_excel_tables(results: Dict, percentiles: List[int], max_levels: int =
         row += 2
     
     row += 1
+    
+    # Calculate volume data first to filter symbols
+    percentile_dfs = build_percentile_depth(results, percentiles, max_levels)
+    mean_df = build_mean_depth(results, max_levels)
+    volume_data = calculate_volume_by_spread_comparison(results, percentiles, percentile_dfs, mean_df, max_levels)
+    
+    # Filter empty symbols and sort
+    results = filter_empty_symbols(results, volume_data)
+    symbols = sort_symbols_by_volatility(results)
     
     # Table 1: Volatility Analysis
     ws.cell(row=row, column=1, value='1. Volatility Analysis - Delta Percentages + Leverage Info').font = title_font
@@ -686,9 +732,6 @@ def create_excel_tables(results: Dict, percentiles: List[int], max_levels: int =
     table2_start = row + 1
     row += 2
 
-    percentile_dfs = build_percentile_depth(results, percentiles, max_levels)
-    mean_df = build_mean_depth(results, max_levels)
-    
     headers = ["Token", "Level"]
     for perc in percentiles:
         headers.append(f"p{perc}")
@@ -757,15 +800,17 @@ def create_excel_tables(results: Dict, percentiles: List[int], max_levels: int =
     table2_end = row - 1
     row += 2
 
-    # Table 3: Token Quantities with Stability Analysis
-    stability_data = calculate_stability_metrics(results, max_levels)
-    
-    ws.cell(row=row, column=1, value='3. Token Quantities Stability Analysis').font = title_font
+    # Table 3: Token Quantities (Mean of Ask/Bid) - RESTORED ORIGINAL
+    ws.cell(row=row, column=1, value='3. Token Quantities - Mean of Ask/Bid').font = title_font
     table3_start = row + 1
     row += 2
     
-    stability_headers = ["Symbol", "Level", "Side", "Mean", "SD", "CV", "IQR", "Autocorr", "Count"]
-    for c, hdr in enumerate(stability_headers, start=1):
+    headers = ["Symbol", "Level"]
+    for perc in percentiles:
+        headers.append(f"p{perc}")
+    headers.append("mean")
+    
+    for c, hdr in enumerate(headers, start=1):
         cell = ws.cell(row=row, column=c, value=hdr)
         cell.font = header_font
         cell.fill = header_fill
@@ -774,38 +819,68 @@ def create_excel_tables(results: Dict, percentiles: List[int], max_levels: int =
     
     for symbol in symbols:
         for level in range(1, max_levels + 1):
-            for side in ['bid', 'ask']:
-                if symbol in stability_data and side in stability_data[symbol] and level in stability_data[symbol][side]:
-                    stats = stability_data[symbol][side][level]['qty']
-                    col = 1
-                    ws.cell(row=row, column=col, value=symbol).alignment = center
-                    col += 1
-                    ws.cell(row=row, column=col, value=f"N{level}").alignment = center
-                    col += 1
-                    ws.cell(row=row, column=col, value=side.upper()).alignment = center
-                    col += 1
-                    ws.cell(row=row, column=col, value=stats['mean']).alignment = center
-                    col += 1
-                    ws.cell(row=row, column=col, value=stats['sd']).alignment = center
-                    col += 1
-                    ws.cell(row=row, column=col, value=stats['cv']).alignment = center
-                    col += 1
-                    ws.cell(row=row, column=col, value=stats['iqr']).alignment = center
-                    col += 1
-                    ws.cell(row=row, column=col, value=stats['autocorr']).alignment = center
-                    col += 1
-                    ws.cell(row=row, column=col, value=stats['count']).alignment = center
-                    row += 1
+            col = 1
+            ws.cell(row=row, column=col, value=symbol).alignment = center
+            col += 1
+            ws.cell(row=row, column=col, value=f"N{level}").alignment = center
+            col += 1
+            
+            # Percentiles
+            for perc in percentiles:
+                pct_df = percentile_dfs[perc]
+                
+                ask_qty = pct_df.loc[(pct_df['symbol'] == symbol) & (pct_df['side'] == 'ask') & (pct_df['level'] == level), 'acc_qty']
+                bid_qty = pct_df.loc[(pct_df['symbol'] == symbol) & (pct_df['side'] == 'bid') & (pct_df['level'] == level), 'acc_qty']
+                
+                ask_qty_val = ask_qty.iloc[0] if len(ask_qty) > 0 and not pd.isna(ask_qty.iloc[0]) else np.nan
+                bid_qty_val = bid_qty.iloc[0] if len(bid_qty) > 0 and not pd.isna(bid_qty.iloc[0]) else np.nan
+                
+                if not np.isnan(ask_qty_val) and not np.isnan(bid_qty_val):
+                    qty_mean = (ask_qty_val + bid_qty_val) / 2
+                elif not np.isnan(ask_qty_val):
+                    qty_mean = ask_qty_val
+                elif not np.isnan(bid_qty_val):
+                    qty_mean = bid_qty_val
+                else:
+                    qty_mean = None
+                    
+                ws.cell(row=row, column=col, value=qty_mean).alignment = center
+                col += 1
+            
+            # Mean values
+            ask_qty = mean_df.loc[(mean_df['symbol'] == symbol) & (mean_df['side'] == 'ask') & (mean_df['level'] == level), 'acc_qty']
+            bid_qty = mean_df.loc[(mean_df['symbol'] == symbol) & (mean_df['side'] == 'bid') & (mean_df['level'] == level), 'acc_qty']
+            
+            ask_qty_val = ask_qty.iloc[0] if len(ask_qty) > 0 and not pd.isna(ask_qty.iloc[0]) else np.nan
+            bid_qty_val = bid_qty.iloc[0] if len(bid_qty) > 0 and not pd.isna(bid_qty.iloc[0]) else np.nan
+            
+            if not np.isnan(ask_qty_val) and not np.isnan(bid_qty_val):
+                qty_mean = (ask_qty_val + bid_qty_val) / 2
+            elif not np.isnan(ask_qty_val):
+                qty_mean = ask_qty_val
+            elif not np.isnan(bid_qty_val):
+                qty_mean = bid_qty_val
+            else:
+                qty_mean = None
+                
+            ws.cell(row=row, column=col, value=qty_mean).alignment = center
+            
+            row += 1
     
     table3_end = row - 1
     row += 2
 
-    # Table 4: USD Values Stability Analysis
-    ws.cell(row=row, column=1, value='4. USD Values Stability Analysis').font = title_font
+    # Table 4: USD Values (Mean of Ask/Bid) - RESTORED ORIGINAL
+    ws.cell(row=row, column=1, value='4. USD Values - Mean of Ask/Bid').font = title_font
     table4_start = row + 1
     row += 2
     
-    for c, hdr in enumerate(stability_headers, start=1):
+    headers = ["Symbol", "Level"]
+    for perc in percentiles:
+        headers.append(f"p{perc}")
+    headers.append("mean")
+    
+    for c, hdr in enumerate(headers, start=1):
         cell = ws.cell(row=row, column=c, value=hdr)
         cell.font = header_font
         cell.fill = header_fill
@@ -814,48 +889,63 @@ def create_excel_tables(results: Dict, percentiles: List[int], max_levels: int =
     
     for symbol in symbols:
         for level in range(1, max_levels + 1):
-            for side in ['bid', 'ask']:
-                if symbol in stability_data and side in stability_data[symbol] and level in stability_data[symbol][side]:
-                    stats = stability_data[symbol][side][level]['usd']
-                    col = 1
-                    ws.cell(row=row, column=col, value=symbol).alignment = center
-                    col += 1
-                    ws.cell(row=row, column=col, value=f"N{level}").alignment = center
-                    col += 1
-                    ws.cell(row=row, column=col, value=side.upper()).alignment = center
-                    col += 1
-                    cell = ws.cell(row=row, column=col, value=stats['mean'])
-                    cell.alignment = center
-                    if stats['mean'] and not pd.isna(stats['mean']):
-                        cell.style = currency_style
-                    col += 1
-                    cell = ws.cell(row=row, column=col, value=stats['sd'])
-                    cell.alignment = center
-                    if stats['sd'] and not pd.isna(stats['sd']):
-                        cell.style = currency_style
-                    col += 1
-                    ws.cell(row=row, column=col, value=stats['cv']).alignment = center
-                    col += 1
-                    cell = ws.cell(row=row, column=col, value=stats['iqr'])
-                    cell.alignment = center
-                    if stats['iqr'] and not pd.isna(stats['iqr']):
-                        cell.style = currency_style
-                    col += 1
-                    ws.cell(row=row, column=col, value=stats['autocorr']).alignment = center
-                    col += 1
-                    ws.cell(row=row, column=col, value=stats['count']).alignment = center
-                    row += 1
+            col = 1
+            ws.cell(row=row, column=col, value=symbol).alignment = center
+            col += 1
+            ws.cell(row=row, column=col, value=f"N{level}").alignment = center
+            col += 1
+            
+            # Percentiles
+            for perc in percentiles:
+                pct_df = percentile_dfs[perc]
+                
+                ask_usd = pct_df.loc[(pct_df['symbol'] == symbol) & (pct_df['side'] == 'ask') & (pct_df['level'] == level), 'acc_usd']
+                bid_usd = pct_df.loc[(pct_df['symbol'] == symbol) & (pct_df['side'] == 'bid') & (pct_df['level'] == level), 'acc_usd']
+                
+                ask_usd_val = ask_usd.iloc[0] if len(ask_usd) > 0 and not pd.isna(ask_usd.iloc[0]) else np.nan
+                bid_usd_val = bid_usd.iloc[0] if len(bid_usd) > 0 and not pd.isna(bid_usd.iloc[0]) else np.nan
+                
+                if not np.isnan(ask_usd_val) and not np.isnan(bid_usd_val):
+                    usd_mean = (ask_usd_val + bid_usd_val) / 2
+                elif not np.isnan(ask_usd_val):
+                    usd_mean = ask_usd_val
+                elif not np.isnan(bid_usd_val):
+                    usd_mean = bid_usd_val
+                else:
+                    usd_mean = None
+                    
+                cell = ws.cell(row=row, column=col, value=usd_mean)
+                cell.alignment = center
+                if usd_mean is not None:
+                    cell.style = currency_style
+                col += 1
+            
+            # Mean values
+            ask_usd = mean_df.loc[(mean_df['symbol'] == symbol) & (mean_df['side'] == 'ask') & (mean_df['level'] == level), 'acc_usd']
+            bid_usd = mean_df.loc[(mean_df['symbol'] == symbol) & (mean_df['side'] == 'bid') & (mean_df['level'] == level), 'acc_usd']
+            
+            ask_usd_val = ask_usd.iloc[0] if len(ask_usd) > 0 and not pd.isna(ask_usd.iloc[0]) else np.nan
+            bid_usd_val = bid_usd.iloc[0] if len(bid_usd) > 0 and not pd.isna(bid_usd.iloc[0]) else np.nan
+            
+            if not np.isnan(ask_usd_val) and not np.isnan(bid_usd_val):
+                usd_mean = (ask_usd_val + bid_usd_val) / 2
+            elif not np.isnan(ask_usd_val):
+                usd_mean = ask_usd_val
+            elif not np.isnan(bid_usd_val):
+                usd_mean = bid_usd_val
+            else:
+                usd_mean = None
+                
+            cell = ws.cell(row=row, column=col, value=usd_mean)
+            cell.alignment = center
+            if usd_mean is not None:
+                cell.style = currency_style
+            
+            row += 1
     
     table4_end = row - 1
     row += 2
 
-    # Calculate volume data
-    volume_data = calculate_volume_by_spread_comparison(results, percentiles, percentile_dfs, mean_df, max_levels)
-    
-    # Filter empty symbols
-    results = filter_empty_symbols(results, volume_data)
-    symbols = list(results.keys())
-    
     # Volume tables with summary statistics
     volume_tables = [f'p{p}' for p in percentiles] + ['mean']
     table_starts = []
@@ -902,8 +992,92 @@ def create_excel_tables(results: Dict, percentiles: List[int], max_levels: int =
     
     row += 1
     
-    # Add plots section
+    # Token Quantities Stability Analysis
+    stability_data = calculate_stability_metrics(results, max_levels)
+    
     final_table_num = 5 + len(volume_tables)
+    ws.cell(row=row, column=1, value=f'{final_table_num}. Token Quantities Stability Analysis (Mean of Bid/Ask)').font = title_font
+    stability_table1_start = row + 1
+    row += 2
+    
+    stability_headers = ["Symbol", "Level", "Mean", "SD", "CV", "IQR", "Autocorr"]
+    for c, hdr in enumerate(stability_headers, start=1):
+        cell = ws.cell(row=row, column=c, value=hdr)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = center
+    row += 1
+    
+    for symbol in symbols:
+        for level in range(1, max_levels + 1):
+            if symbol in stability_data and level in stability_data[symbol]:
+                stats = stability_data[symbol][level]['qty']
+                col = 1
+                ws.cell(row=row, column=col, value=symbol).alignment = center
+                col += 1
+                ws.cell(row=row, column=col, value=f"N{level}").alignment = center
+                col += 1
+                ws.cell(row=row, column=col, value=stats['mean']).alignment = center
+                col += 1
+                ws.cell(row=row, column=col, value=stats['sd']).alignment = center
+                col += 1
+                ws.cell(row=row, column=col, value=stats['cv']).alignment = center
+                col += 1
+                ws.cell(row=row, column=col, value=stats['iqr']).alignment = center
+                col += 1
+                ws.cell(row=row, column=col, value=stats['autocorr']).alignment = center
+                row += 1
+    
+    stability_table1_end = row - 1
+    row += 2
+
+    # USD Values Stability Analysis
+    final_table_num += 1
+    ws.cell(row=row, column=1, value=f'{final_table_num}. USD Values Stability Analysis (Mean of Bid/Ask)').font = title_font
+    stability_table2_start = row + 1
+    row += 2
+    
+    for c, hdr in enumerate(stability_headers, start=1):
+        cell = ws.cell(row=row, column=c, value=hdr)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = center
+    row += 1
+    
+    for symbol in symbols:
+        for level in range(1, max_levels + 1):
+            if symbol in stability_data and level in stability_data[symbol]:
+                stats = stability_data[symbol][level]['usd']
+                col = 1
+                ws.cell(row=row, column=col, value=symbol).alignment = center
+                col += 1
+                ws.cell(row=row, column=col, value=f"N{level}").alignment = center
+                col += 1
+                cell = ws.cell(row=row, column=col, value=stats['mean'])
+                cell.alignment = center
+                if stats['mean'] and not pd.isna(stats['mean']):
+                    cell.style = currency_style
+                col += 1
+                cell = ws.cell(row=row, column=col, value=stats['sd'])
+                cell.alignment = center
+                if stats['sd'] and not pd.isna(stats['sd']):
+                    cell.style = currency_style
+                col += 1
+                ws.cell(row=row, column=col, value=stats['cv']).alignment = center
+                col += 1
+                cell = ws.cell(row=row, column=col, value=stats['iqr'])
+                cell.alignment = center
+                if stats['iqr'] and not pd.isna(stats['iqr']):
+                    cell.style = currency_style
+                col += 1
+                ws.cell(row=row, column=col, value=stats['autocorr']).alignment = center
+                row += 1
+    
+    stability_table2_end = row - 1
+    row += 2
+
+    # Add plots section
+    final_table_num += 1
     ws.cell(row=row, column=1, value=f'{final_table_num}. Orderbook Depth Analysis Plots').font = title_font
     row += 2
     
@@ -932,6 +1106,8 @@ def create_excel_tables(results: Dict, percentiles: List[int], max_levels: int =
         ws.row_dimensions.group(table4_start, table4_end, outline_level=1, hidden=False)
         for table_start, table_end in zip(table_starts, table_ends):
             ws.row_dimensions.group(table_start, table_end, outline_level=1, hidden=False)
+        ws.row_dimensions.group(stability_table1_start, stability_table1_end, outline_level=1, hidden=False)
+        ws.row_dimensions.group(stability_table2_start, stability_table2_end, outline_level=1, hidden=False)
     except:
         pass
 
@@ -940,45 +1116,6 @@ def create_excel_tables(results: Dict, percentiles: List[int], max_levels: int =
         ws.column_dimensions[get_column_letter(c)].width = 12
     
     workbook.save(output_filename)
-
-def add_summary_statistics_volume(ws, data_dict: Dict, start_row: int, col_start: int = 2) -> int:
-    symbols = list(data_dict.keys())
-    if not symbols:
-        return start_row
-    
-    vol_keys = ['3min_vol', '5min_vol', '10min_vol', '30min_vol', '60min_vol', '90min_vol', '1day_vol', '1year_vol']
-    quantile_labels = ['Min', '25%', '50%', '75%', 'Max', 'Mean']
-    
-    for i, label in enumerate(quantile_labels):
-        row = start_row + i
-        cell = ws.cell(row=row, column=1, value=label)
-        cell.font = Font(bold=True, color='0066CC')
-        cell.alignment = Alignment(horizontal='center', vertical='center')
-        
-        for col_idx, vol_key in enumerate(vol_keys):
-            col = col_start + col_idx
-            
-            values = [data_dict[sym][vol_key] for sym in symbols if vol_key in data_dict[sym] and data_dict[sym][vol_key] > 0]
-            
-            if values:
-                if label == 'Min':
-                    stat_val = min(values)
-                elif label == '25%':
-                    stat_val = np.percentile(values, 25)
-                elif label == '50%':
-                    stat_val = np.percentile(values, 50)
-                elif label == '75%':
-                    stat_val = np.percentile(values, 75)
-                elif label == 'Max':
-                    stat_val = max(values)
-                elif label == 'Mean':
-                    stat_val = np.mean(values)
-                
-                cell = ws.cell(row=row, column=col, value=stat_val)
-                cell.alignment = Alignment(horizontal='center', vertical='center')
-                cell.style = 'currency'
-    
-    return start_row + len(quantile_labels)
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description='Volatility and orderbook analysis with configurable levels and stability metrics')
@@ -1021,4 +1158,4 @@ def main():
     print(f"Plots saved to {PLOTS_DIR}")
 
 if __name__ == '__main__':
-    main()
+    main() 
